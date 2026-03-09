@@ -8,6 +8,24 @@ version = "0.1.0"
 description = "Reusable local configuration wizard for Ansible deployment repos"
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["ansible", "automation", "cli", "configuration", "deployment", "wizard"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Installation/Setup",
+  "Topic :: System :: Systems Administration",
+  "Typing :: Typed",
+  "Private :: Do Not Upload",
+]
+import-names = ["ansible_config_wizard"]
 dependencies = [
   "cryptography>=44.0.0",
   "jinja2>=3.1.5",
@@ -23,8 +41,12 @@ ansible-config-wizard = "ansible_config_wizard.cli:app"
 
 [dependency-groups]
 dev = [
+  "build>=1.2.2.post1",
   "pytest>=8.3.5",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ansible_config_wizard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

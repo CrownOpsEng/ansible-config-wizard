@@ -2,6 +2,11 @@
 
 Reusable local configuration wizard for Ansible deployment repositories.
 
+This repository is intended to be public on GitHub as a shared tooling repository.
+The package is not intended for PyPI publication yet, so the project metadata includes
+the `Private :: Do Not Upload` classifier to block accidental uploads while the API and
+release process are still being stabilized.
+
 ## Design
 
 This package owns the generic workflow:
@@ -24,8 +29,9 @@ Consumer repositories own their deployment-specific pieces:
 
 ```bash
 uv venv
-uv sync
+uv sync --group dev
 uv run pytest
+uv run python -m build
 ```
 
 ## Consumer repo pattern
@@ -57,3 +63,8 @@ The `builder` field in the profile should reference a callable using `module:cal
 ```yaml
 builder: wizard_support.builders:build_site_context
 ```
+
+## Release notes
+
+- Choose and add a real license before publishing the repository for reuse outside your organization.
+- Remove the `Private :: Do Not Upload` classifier only when you are ready to publish distribution artifacts to an index such as PyPI.
