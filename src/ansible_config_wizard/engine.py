@@ -32,6 +32,23 @@ class WizardPaused(RuntimeError):
     pass
 
 
+class RedactingConsoleWriter:
+    def __init__(self, console: Console, secrets: list[str] | None = None) -> None:
+        self.console = console
+        self.secrets = [secret for secret in (secrets or []) if secret]
+
+    def write(self, data: str) -> None:
+        if not data:
+            return
+        rendered = data
+        for secret in self.secrets:
+            rendered = rendered.replace(secret, "[redacted]")
+        self.console.print(rendered, end="", markup=False, highlight=False, soft_wrap=True)
+
+    def flush(self) -> None:
+        return
+
+
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-").lower()
     return slug or "default"
@@ -430,7 +447,13 @@ def build_ssh_setup_commands(host: str, ssh_user: str, public_key_path: str, pri
     return "\n".join([copy_id, verify, resume_command.strip()])
 
 
-def install_ssh_key_with_password(host: str, ssh_user: str, public_key_path: str, password: str) -> None:
+def install_ssh_key_with_password(
+    host: str,
+    ssh_user: str,
+    public_key_path: str,
+    password: str,
+    console: Console,
+) -> None:
     command = [
         "ssh-copy-id",
         "-o", "IdentitiesOnly=yes",
@@ -440,7 +463,16 @@ def install_ssh_key_with_password(host: str, ssh_user: str, public_key_path: str
         "-i", public_key_path,
         f"{ssh_user}@{host}",
     ]
+    console.print("[cyan]Running local SSH key install:[/cyan]")
+    console.print(
+        format_shell_command(["env", "-u", "SSH_AUTH_SOCK", *command]),
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
+    console.print()
     child = pexpect.spawn(command[0], command[1:], env=ssh_command_env(), encoding="utf-8", timeout=30, echo=False)
+    child.logfile_read = RedactingConsoleWriter(console, secrets=[password])
     password_prompts = 0
     output = ""
     try:
@@ -471,6 +503,8 @@ def install_ssh_key_with_password(host: str, ssh_user: str, public_key_path: str
             raise WizardError("Timed out while waiting for ssh-copy-id to complete.")
     finally:
         child.close()
+
+    console.print()
 
     if child.exitstatus != 0:
         raise WizardError(f"ssh-copy-id failed with exit code {child.exitstatus}: {output.strip() or 'no output'}")
@@ -531,7 +565,7 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
             if not password:
                 console.print("[yellow]No password entered.[/yellow]")
                 continue
-            install_ssh_key_with_password(host, ssh_user, public_key_path, password)
+            install_ssh_key_with_password(host, ssh_user, public_key_path, password, console)
             verify_ssh_key_access(host, ssh_user, private_key_path)
             console.print("[green]Managed SSH key installed and verified.[/green]")
             return

@@ -6,8 +6,26 @@ from pathlib import Path
 import yaml
 
 import pytest
+from rich.console import Console
 
-from ansible_config_wizard.engine import WizardError, build_ssh_setup_commands, evaluate_condition, run_wizard
+from ansible_config_wizard.engine import (
+    RedactingConsoleWriter,
+    WizardError,
+    build_ssh_setup_commands,
+    evaluate_condition,
+    run_wizard,
+)
+
+
+class Buffer:
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+
+    def write(self, text: str) -> None:
+        self.parts.append(text)
+
+    def flush(self) -> None:
+        return
 
 
 def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
@@ -75,3 +93,14 @@ def test_build_ssh_setup_commands_disables_agent_keys() -> None:
     assert "IdentitiesOnly=yes" in commands
     assert "IdentityAgent=none" in commands
     assert "203.0.113.10" in commands
+
+
+def test_redacting_console_writer_masks_secrets() -> None:
+    output = Buffer()
+    console = Console(file=output, force_terminal=False, color_system=None)
+    writer = RedactingConsoleWriter(console, secrets=["super-secret"])
+
+    writer.write("password: super-secret\n")
+
+    assert "super-secret" not in "".join(output.parts)
+    assert "[redacted]" in "".join(output.parts)
