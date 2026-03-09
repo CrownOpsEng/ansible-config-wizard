@@ -382,21 +382,50 @@ def ssh_command_env() -> dict[str, str]:
     return env
 
 
+def format_shell_command(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    rendered = [shlex.quote(part) for part in parts]
+    if len(rendered) == 1:
+        return rendered[0]
+    return f"{rendered[0]} \\\n  " + " \\\n  ".join(rendered[1:])
+
+
 def build_ssh_setup_commands(host: str, ssh_user: str, public_key_path: str, private_key_path: str, resume_command: str) -> str:
     target = f"{ssh_user}@{host}"
-    copy_id = (
-        "env -u SSH_AUTH_SOCK ssh-copy-id "
-        "-o IdentitiesOnly=yes "
-        "-o IdentityAgent=none "
-        "-o PreferredAuthentications=password "
-        "-o PubkeyAuthentication=no "
-        f"-i {shlex.quote(public_key_path)} {shlex.quote(target)}"
+    copy_id = format_shell_command(
+        [
+            "env",
+            "-u",
+            "SSH_AUTH_SOCK",
+            "ssh-copy-id",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityAgent=none",
+            "-o",
+            "PreferredAuthentications=password",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-i",
+            public_key_path,
+            target,
+        ]
     )
-    verify = (
-        "env -u SSH_AUTH_SOCK ssh "
-        "-o IdentitiesOnly=yes "
-        "-o IdentityAgent=none "
-        f"-i {shlex.quote(private_key_path)} {shlex.quote(target)}"
+    verify = format_shell_command(
+        [
+            "env",
+            "-u",
+            "SSH_AUTH_SOCK",
+            "ssh",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityAgent=none",
+            "-i",
+            private_key_path,
+            target,
+        ]
     )
     return "\n".join([copy_id, verify, resume_command.strip()])
 

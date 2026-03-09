@@ -70,7 +70,8 @@ def test_build_ssh_setup_commands_disables_agent_keys() -> None:
         resume_command="./scripts/configure.sh --answers-file /tmp/state.yml",
     )
 
-    assert "env -u SSH_AUTH_SOCK ssh-copy-id" in commands
-    assert "-o IdentitiesOnly=yes" in commands
-    assert "-o IdentityAgent=none" in commands
+    assert "ssh-copy-id" in commands
+    assert "SSH_AUTH_SOCK" in commands
+    assert "IdentitiesOnly=yes" in commands
+    assert "IdentityAgent=none" in commands
     assert "203.0.113.10" in commands
