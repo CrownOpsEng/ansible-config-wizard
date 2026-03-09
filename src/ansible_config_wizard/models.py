@@ -45,6 +45,7 @@ class ActionModel(BaseModel):
     kind: Literal["pause"] = "pause"
     when: str | None = None
     message_template: str
+    commands_template: str | None = None
     prompt: str = "Continue after completing this step?"
     save_state: bool = False
 

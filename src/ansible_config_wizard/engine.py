@@ -367,6 +367,13 @@ def write_resume_state(context: dict[str, Any]) -> Path:
     return path
 
 
+def write_action_commands(section: SectionModel, commands: str, context: dict[str, Any]) -> Path:
+    path = Path(context["wizard_run_dir"]) / f"{slugify(section.id)}-commands.sh"
+    script = "#!/usr/bin/env bash\nset -euo pipefail\n\n" + commands.strip() + "\n"
+    atomic_write(path, script, 0o700)
+    return path
+
+
 def run_section_actions(
     section: SectionModel,
     context: dict[str, Any],
@@ -383,7 +390,18 @@ def run_section_actions(
 
         message = render_template_string(action.message_template, context)
         console.print(f"[yellow][bold]{section.title}[/bold][/yellow]")
-        console.print(message)
+        console.print(message, soft_wrap=True, highlight=False)
+
+        if action.commands_template:
+            commands = render_template_string(action.commands_template, context).strip()
+            command_path = write_action_commands(section, commands, context)
+            console.print()
+            console.print("[cyan]Commands file:[/cyan]")
+            console.print(str(command_path), soft_wrap=True, highlight=False)
+            console.print()
+            console.print("[cyan]Commands:[/cyan]")
+            console.print(commands, soft_wrap=True, highlight=False)
+            console.print()
 
         choice = questionary.select(
             action.prompt,
