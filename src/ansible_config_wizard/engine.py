@@ -5,11 +5,13 @@ import copy
 import json
 import os
 import re
+import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pexpect
 import questionary
 import yaml
 from jinja2 import Environment, FileSystemLoader
@@ -374,6 +376,147 @@ def write_action_commands(section: SectionModel, commands: str, context: dict[st
     return path
 
 
+def ssh_command_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("SSH_AUTH_SOCK", None)
+    return env
+
+
+def build_ssh_setup_commands(host: str, ssh_user: str, public_key_path: str, private_key_path: str, resume_command: str) -> str:
+    target = f"{ssh_user}@{host}"
+    copy_id = (
+        "env -u SSH_AUTH_SOCK ssh-copy-id "
+        "-o IdentitiesOnly=yes "
+        "-o IdentityAgent=none "
+        "-o PreferredAuthentications=password "
+        "-o PubkeyAuthentication=no "
+        f"-i {shlex.quote(public_key_path)} {shlex.quote(target)}"
+    )
+    verify = (
+        "env -u SSH_AUTH_SOCK ssh "
+        "-o IdentitiesOnly=yes "
+        "-o IdentityAgent=none "
+        f"-i {shlex.quote(private_key_path)} {shlex.quote(target)}"
+    )
+    return "\n".join([copy_id, verify, resume_command.strip()])
+
+
+def install_ssh_key_with_password(host: str, ssh_user: str, public_key_path: str, password: str) -> None:
+    command = [
+        "ssh-copy-id",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "IdentityAgent=none",
+        "-o", "PreferredAuthentications=password",
+        "-o", "PubkeyAuthentication=no",
+        "-i", public_key_path,
+        f"{ssh_user}@{host}",
+    ]
+    child = pexpect.spawn(command[0], command[1:], env=ssh_command_env(), encoding="utf-8", timeout=30, echo=False)
+    password_prompts = 0
+    output = ""
+    try:
+        while True:
+            index = child.expect(
+                [
+                    r"Are you sure you want to continue connecting \(yes/no(?:/\[fingerprint\])?\)\?",
+                    r"(?i)password:",
+                    r"Too many authentication failures",
+                    pexpect.EOF,
+                    pexpect.TIMEOUT,
+                ]
+            )
+            output += child.before
+            if index == 0:
+                child.sendline("yes")
+                continue
+            if index == 1:
+                password_prompts += 1
+                if password_prompts > 3:
+                    raise WizardError("SSH password was rejected too many times while installing the managed key.")
+                child.sendline(password)
+                continue
+            if index == 2:
+                raise WizardError("SSH key install failed because the server rejected too many authentication attempts.")
+            if index == 3:
+                break
+            raise WizardError("Timed out while waiting for ssh-copy-id to complete.")
+    finally:
+        child.close()
+
+    if child.exitstatus != 0:
+        raise WizardError(f"ssh-copy-id failed with exit code {child.exitstatus}: {output.strip() or 'no output'}")
+
+
+def verify_ssh_key_access(host: str, ssh_user: str, private_key_path: str) -> None:
+    command = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "IdentityAgent=none",
+        "-i", private_key_path,
+        f"{ssh_user}@{host}",
+        "exit",
+    ]
+    result = subprocess.run(command, check=False, env=ssh_command_env(), capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip() or "no output"
+        raise WizardError(f"Managed SSH key installed, but verification failed: {stderr}")
+
+
+def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: dict[str, Any], console: Console) -> None:
+    host = render_template_string(action.host_template, context)
+    ssh_user = render_template_string(action.ssh_user_template, context)
+    public_key_path = render_template_string(action.public_key_path_template, context)
+    private_key_path = render_template_string(action.private_key_path_template, context)
+    resume_command = f"./scripts/configure.sh --answers-file {context['wizard_resume_state_path']}"
+    commands = (
+        render_template_string(action.commands_template, context).strip()
+        if action.commands_template
+        else build_ssh_setup_commands(host, ssh_user, public_key_path, private_key_path, resume_command)
+    )
+
+    while True:
+        message = render_template_string(action.message_template, context)
+        console.print(f"[yellow][bold]{section.title}[/bold][/yellow]")
+        console.print(message, soft_wrap=True, highlight=False)
+        command_path = write_action_commands(section, commands, context)
+        console.print()
+        console.print("[cyan]Commands file:[/cyan]")
+        console.print(str(command_path), soft_wrap=True, highlight=False)
+        console.print()
+        console.print("[cyan]Commands:[/cyan]")
+        console.print(commands, soft_wrap=True, highlight=False)
+        console.print()
+
+        choice = questionary.select(
+            action.prompt,
+            choices=[
+                "Install key now with password",
+                "Exit and resume later",
+                "Continue now",
+            ],
+            default="Install key now with password",
+        ).ask()
+        if choice == "Install key now with password":
+            password = questionary.password(f"Password for {ssh_user}@{host}").ask()
+            if not password:
+                console.print("[yellow]No password entered.[/yellow]")
+                continue
+            install_ssh_key_with_password(host, ssh_user, public_key_path, password)
+            verify_ssh_key_access(host, ssh_user, private_key_path)
+            console.print("[green]Managed SSH key installed and verified.[/green]")
+            return
+        if choice == "Exit and resume later":
+            resume_state_path = ""
+            if action.save_state:
+                resume_state_path = str(write_resume_state(context))
+                context["resume_state_path"] = resume_state_path
+            if resume_state_path:
+                console.print(f"[yellow]Resume later with:[/yellow] [bold]--answers-file {resume_state_path}[/bold]")
+            raise WizardPaused("Wizard paused by operator.")
+        return
+
+
 def run_section_actions(
     section: SectionModel,
     context: dict[str, Any],
@@ -386,6 +529,10 @@ def run_section_actions(
             continue
 
         if assume_yes:
+            continue
+
+        if action.kind == "ssh_setup":
+            run_ssh_setup_action(action, section, context, console)
             continue
 
         message = render_template_string(action.message_template, context)

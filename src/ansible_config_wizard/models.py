@@ -42,12 +42,16 @@ class SectionModel(BaseModel):
 
 
 class ActionModel(BaseModel):
-    kind: Literal["pause"] = "pause"
+    kind: Literal["pause", "ssh_setup"] = "pause"
     when: str | None = None
     message_template: str
     commands_template: str | None = None
     prompt: str = "Continue after completing this step?"
     save_state: bool = False
+    host_template: str | None = None
+    ssh_user_template: str | None = None
+    public_key_path_template: str | None = None
+    private_key_path_template: str | None = None
 
 
 class OutputModel(BaseModel):

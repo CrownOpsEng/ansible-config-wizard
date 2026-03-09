@@ -7,7 +7,7 @@ import yaml
 
 import pytest
 
-from ansible_config_wizard.engine import WizardError, evaluate_condition, run_wizard
+from ansible_config_wizard.engine import WizardError, build_ssh_setup_commands, evaluate_condition, run_wizard
 
 
 def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
@@ -59,3 +59,18 @@ def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
 def test_evaluate_condition_rejects_unsafe_code() -> None:
     with pytest.raises(WizardError):
         evaluate_condition("__import__('os').system('true')", {"enabled": True})
+
+
+def test_build_ssh_setup_commands_disables_agent_keys() -> None:
+    commands = build_ssh_setup_commands(
+        host="203.0.113.10",
+        ssh_user="ubuntu",
+        public_key_path="/tmp/test key.pub",
+        private_key_path="/tmp/test key",
+        resume_command="./scripts/configure.sh --answers-file /tmp/state.yml",
+    )
+
+    assert "env -u SSH_AUTH_SOCK ssh-copy-id" in commands
+    assert "-o IdentitiesOnly=yes" in commands
+    assert "-o IdentityAgent=none" in commands
+    assert "203.0.113.10" in commands

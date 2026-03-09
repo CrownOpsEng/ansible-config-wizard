@@ -34,6 +34,13 @@ When a consumer profile wants the wizard to manage the long-term Ansible SSH ide
 - `$ANSIBLE_CONFIG_WIZARD_SSH_HOME/<repo>` when `ANSIBLE_CONFIG_WIZARD_SSH_HOME` is set
 - otherwise `~/.ssh/ansible-config-wizard/<repo>`
 
+The shared action layer also supports an `ssh_setup` action for first-run host access:
+
+- prints copy-friendly `ssh-copy-id`, `ssh`, and resume commands
+- writes those commands to an executable script in the wizard run directory
+- can install the managed public key immediately with a one-shot password prompt
+- disables agent-based key offers during that install step to avoid `Too many authentication failures`
+
 Wizard-generated resume-state files are best-effort securely deleted after a successful resumed run:
 
 - `shred --remove --zero` when `shred` is available
