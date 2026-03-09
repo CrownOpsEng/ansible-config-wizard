@@ -7,6 +7,8 @@ The package is not intended for PyPI publication yet, so the project metadata in
 the `Private :: Do Not Upload` classifier to block accidental uploads while the API and
 release process are still being stabilized.
 
+License: MIT. See [LICENSE](LICENSE).
+
 ## Design
 
 This package owns the generic workflow:
@@ -66,5 +68,4 @@ builder: wizard_support.builders:build_site_context
 
 ## Release notes
 
-- Choose and add a real license before publishing the repository for reuse outside your organization.
 - Remove the `Private :: Do Not Upload` classifier only when you are ready to publish distribution artifacts to an index such as PyPI.
