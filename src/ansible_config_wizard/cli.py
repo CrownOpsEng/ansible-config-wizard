@@ -5,7 +5,7 @@ from typing import Optional
 
 import typer
 
-from .engine import WizardError, run_wizard
+from .engine import WizardError, WizardPaused, run_wizard
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 
@@ -31,6 +31,8 @@ def main(
     except WizardError as exc:
         typer.secho(f"ERROR: {exc}", err=True, fg=typer.colors.RED)
         raise typer.Exit(code=1) from exc
+    except WizardPaused:
+        raise typer.Exit(code=0)
 
 
 if __name__ == "__main__":

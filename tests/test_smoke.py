@@ -33,3 +33,9 @@ def test_run_wizard_with_external_builder(tmp_path: Path) -> None:
     assert all_vars["base_domain"] == "example.com"
     assert all_vars["derived_domain"] == "ops.example.com"
     assert vault_vars["vault_demo_password"]
+    assert (repo_root / "reports/bootstrap-ssh/demo-01").exists()
+    assert (repo_root / "reports/bootstrap-ssh/demo-01.pub").exists()
+    public_key = (repo_root / "reports/bootstrap-ssh/demo-01.pub").read_text(encoding="utf-8").strip()
+    assert public_key.endswith("deploy@demo-01")
+    assert public_key.count("deploy@demo-01") == 1
+    assert any(path.name.startswith("config-wizard-state-") for path in (repo_root / "reports").iterdir())

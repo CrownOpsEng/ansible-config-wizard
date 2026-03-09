@@ -15,7 +15,7 @@ class SourceModel(BaseModel):
 class FieldModel(BaseModel):
     id: str
     label: str
-    type: Literal["text", "password", "confirm", "select", "list", "key_value", "int"] = "text"
+    type: Literal["text", "password", "confirm", "select", "list", "key_value", "int", "ssh_keypair"] = "text"
     help: str | None = None
     required: bool = False
     secret: bool = False
@@ -38,6 +38,15 @@ class SectionModel(BaseModel):
     item_label: str = "item"
     default_count: int = 0
     min_items: int = 0
+    actions: list["ActionModel"] = Field(default_factory=list)
+
+
+class ActionModel(BaseModel):
+    kind: Literal["pause"] = "pause"
+    when: str | None = None
+    message_template: str
+    prompt: str = "Continue after completing this step?"
+    save_state: bool = False
 
 
 class OutputModel(BaseModel):

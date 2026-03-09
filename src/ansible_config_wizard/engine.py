@@ -14,12 +14,16 @@ from rich.console import Console
 from rich.panel import Panel
 
 from .generators import generate_value
-from .models import FieldModel, OutputModel, ProfileModel, SectionModel
+from .models import ActionModel, FieldModel, OutputModel, ProfileModel, SectionModel
 from .resolver import resolve_builder
 from .writers import atomic_write, backup_existing
 
 
 class WizardError(RuntimeError):
+    pass
+
+
+class WizardPaused(RuntimeError):
     pass
 
 
@@ -113,17 +117,66 @@ def prompt_field(field: FieldModel, default: Any, console: Console) -> Any:
         return normalize_value(field, answer)
     if field.type == "key_value":
         return prompt_key_value(field, default, console)
+    if field.type == "ssh_keypair":
+        return default
     return questionary.text(prompt, default="" if default is None else str(default)).ask()
 
 
-def resolve_field(field: FieldModel, context: dict[str, Any], provided_value: Any, assume_yes: bool, console: Console) -> Any:
+def materialize_generated_value(
+    field: FieldModel,
+    value: Any,
+    context: dict[str, Any],
+    repo_root: Path,
+) -> Any:
+    if field.type != "ssh_keypair" or not isinstance(value, dict):
+        return value
+
+    path_template = field.source.params.get("path_template")
+    comment_template = field.source.params.get("comment_template")
+    rendered_comment = render_template_string(comment_template, context) if comment_template else None
+    if rendered_comment and not value.get("public_key", "").strip().endswith(rendered_comment):
+        comment = rendered_comment
+        value["public_key"] = f"{value['public_key']} {comment}".strip()
+        value["fingerprint"] = value["fingerprint"]
+
+    if not path_template:
+        return value
+
+    base_path = Path(render_template_string(path_template, context))
+    if not base_path.is_absolute():
+        base_path = repo_root / base_path
+    public_path = base_path.with_name(f"{base_path.name}.pub")
+
+    backup_existing(base_path)
+    backup_existing(public_path)
+    atomic_write(base_path, value["private_key"].rstrip() + "\n", 0o600)
+    atomic_write(public_path, value["public_key"].rstrip() + "\n", 0o644)
+
+    result = copy.deepcopy(value)
+    result["private_key_path"] = str(base_path)
+    result["public_key_path"] = str(public_path)
+    return result
+
+
+def resolve_field(
+    field: FieldModel,
+    context: dict[str, Any],
+    provided_value: Any,
+    assume_yes: bool,
+    console: Console,
+    repo_root: Path,
+) -> Any:
     default = default_for_field(field, context)
     if provided_value is not None:
         return normalize_value(field, provided_value)
 
     source = field.source
     if source.kind == "generate":
-        value = generate_value(source.generator or "password", source.params)
+        generator_params = copy.deepcopy(source.params)
+        if field.type == "ssh_keypair" and source.params.get("comment_template"):
+            generator_params["comment"] = render_template_string(source.params["comment_template"], context)
+        value = generate_value(source.generator or "password", generator_params)
+        value = materialize_generated_value(field, value, context, repo_root)
         console.print(f"[green]Generated[/green] {field.label}.")
         return value
 
@@ -153,16 +206,16 @@ def resolve_field(field: FieldModel, context: dict[str, Any], provided_value: An
     return normalize_value(field, value)
 
 
-def collect_fields(section: SectionModel, context: dict[str, Any], answers: dict[str, Any], assume_yes: bool, console: Console) -> None:
+def collect_fields(section: SectionModel, context: dict[str, Any], answers: dict[str, Any], assume_yes: bool, console: Console, repo_root: Path) -> None:
     for field in section.fields:
         if not evaluate_condition(field.when, context):
             continue
         provided = answers.get(field.id)
-        value = resolve_field(field, context, provided, assume_yes, console)
+        value = resolve_field(field, context, provided, assume_yes, console, repo_root)
         context[field.id] = value
 
 
-def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: dict[str, Any], assume_yes: bool, console: Console) -> None:
+def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: dict[str, Any], assume_yes: bool, console: Console, repo_root: Path) -> None:
     collection_key = section.collection_key or section.id
     provided_items = answers.get(collection_key)
     items: list[dict[str, Any]] = []
@@ -181,6 +234,7 @@ def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: 
                     provided_item.get(field.id),
                     assume_yes,
                     console,
+                    repo_root,
                 )
             items.append(item)
         context[collection_key] = items
@@ -210,9 +264,49 @@ def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: 
         for field in section.fields:
             if not evaluate_condition(field.when, {**item_context, **item}):
                 continue
-            item[field.id] = resolve_field(field, {**item_context, **item}, None, assume_yes, console)
+            item[field.id] = resolve_field(field, {**item_context, **item}, None, assume_yes, console, repo_root)
         items.append(item)
     context[collection_key] = items
+
+
+def write_resume_state(repo_root: Path, context: dict[str, Any]) -> Path:
+    path = repo_root / "reports" / f"config-wizard-state-{context['timestamp']}.yml"
+    atomic_write(path, yaml.safe_dump(context, sort_keys=False), 0o600)
+    return path
+
+
+def run_section_actions(
+    section: SectionModel,
+    context: dict[str, Any],
+    repo_root: Path,
+    assume_yes: bool,
+    console: Console,
+) -> None:
+    for action in section.actions:
+        if not evaluate_condition(action.when, context):
+            continue
+
+        if action.save_state:
+            context["resume_state_path"] = str(write_resume_state(repo_root, context))
+
+        message = render_template_string(action.message_template, context)
+        console.print(Panel(message, title=section.title, border_style="yellow", expand=False))
+
+        if assume_yes:
+            continue
+
+        choice = questionary.select(
+            action.prompt,
+            choices=["Continue now", "Exit and resume later"],
+            default="Continue now",
+        ).ask()
+        if choice == "Exit and resume later":
+            resume_state_path = context.get("resume_state_path", "")
+            if resume_state_path:
+                console.print(
+                    f"[yellow]Resume later with:[/yellow] [bold]--answers-file {resume_state_path}[/bold]"
+                )
+            raise WizardPaused("Wizard paused by operator.")
 
 
 def yaml_value(value: Any) -> str:
@@ -342,11 +436,14 @@ def run_wizard(
     for section in profile.sections:
         if not evaluate_condition(section.when, context):
             continue
-        console.print(Panel.fit(section.title, subtitle=section.description or "", border_style="blue"))
+        console.print(Panel.fit(section.title, border_style="blue"))
+        if section.description:
+            console.print(f"[dim]{section.description}[/dim]")
         if section.kind == "fields":
-            collect_fields(section, context, provided_answers, assume_yes, console)
+            collect_fields(section, context, provided_answers, assume_yes, console, repo_root)
         else:
-            collect_repeatable(section, context, provided_answers, assume_yes, console)
+            collect_repeatable(section, context, provided_answers, assume_yes, console, repo_root)
+        run_section_actions(section, context, repo_root, assume_yes, console)
 
     write_details = maybe_prompt_option(provided_answers, "write_details", "Write sensitive details file?", False, assume_yes)
     include_secret_details = False

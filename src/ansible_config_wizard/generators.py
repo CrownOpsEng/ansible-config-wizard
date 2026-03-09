@@ -34,7 +34,7 @@ def generate_passphrase(words: int = 8) -> str:
     return "-".join(secrets.choice(PASSPHRASE_WORDS) for _ in range(words))
 
 
-def generate_ed25519_keypair() -> dict[str, str]:
+def generate_ed25519_keypair(comment: str | None = None) -> dict[str, str]:
     private_key = ed25519.Ed25519PrivateKey.generate()
     private_bytes = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -45,6 +45,8 @@ def generate_ed25519_keypair() -> dict[str, str]:
         encoding=serialization.Encoding.OpenSSH,
         format=serialization.PublicFormat.OpenSSH,
     ).decode("utf-8")
+    if comment:
+        public_bytes = f"{public_bytes} {comment}"
     return {
         "private_key": private_bytes,
         "public_key": public_bytes,
@@ -64,6 +66,5 @@ def generate_value(generator: str, params: dict[str, Any] | None = None) -> Any:
     if generator == "passphrase":
         return generate_passphrase(words=int(params.get("words", 8)))
     if generator == "ed25519_keypair":
-        return generate_ed25519_keypair()
+        return generate_ed25519_keypair(comment=params.get("comment"))
     raise ValueError(f"Unsupported generator: {generator}")
-

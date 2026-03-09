@@ -27,6 +27,21 @@ sections:
           generator: password
           params:
             length: 24
+      - id: bootstrap_key
+        label: Bootstrap key
+        type: ssh_keypair
+        source:
+          kind: generate
+          generator: ed25519_keypair
+          params:
+            path_template: reports/bootstrap-ssh/{{ host_name }}
+            comment_template: "{{ ansible_user }}@{{ host_name }}"
+    actions:
+      - kind: pause
+        save_state: true
+        message_template: |
+          Pause point for {{ host_name }}.
+        prompt: Continue after completing this step?
 outputs:
   - id: hosts
     path: inventories/prod/hosts.yml

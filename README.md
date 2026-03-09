@@ -16,6 +16,8 @@ This package owns the generic workflow:
 - schema-driven sections and fields
 - branching prompt flow
 - local secret generation
+- generated SSH keypair materialization for first-run bootstrap flows
+- optional pause and resume checkpoints with saved state
 - file rendering and atomic writes
 - optional audit logging
 - optional `ansible-vault` encryption
