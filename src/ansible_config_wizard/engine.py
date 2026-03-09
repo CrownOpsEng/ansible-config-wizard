@@ -382,7 +382,8 @@ def run_section_actions(
             continue
 
         message = render_template_string(action.message_template, context)
-        console.print(Panel(message, title=section.title, border_style="yellow", expand=False))
+        console.print(f"[yellow][bold]{section.title}[/bold][/yellow]")
+        console.print(message)
 
         choice = questionary.select(
             action.prompt,
