@@ -5,13 +5,17 @@ from pathlib import Path
 
 import yaml
 
-from ansible_config_wizard.engine import run_wizard
+import pytest
+
+from ansible_config_wizard.engine import WizardError, evaluate_condition, run_wizard
 
 
-def test_run_wizard_with_external_builder(tmp_path: Path) -> None:
+def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
     fixture_root = Path(__file__).parent / "fixture_repo"
     shutil.copytree(fixture_root, tmp_path / "repo", dirs_exist_ok=True)
     repo_root = tmp_path / "repo"
+    state_root = tmp_path / "state-home"
+    monkeypatch.setenv("ANSIBLE_CONFIG_WIZARD_STATE_HOME", str(state_root))
 
     run_wizard(
         profile_path=repo_root / "wizard_profiles" / "sample.yml",
@@ -33,9 +37,15 @@ def test_run_wizard_with_external_builder(tmp_path: Path) -> None:
     assert all_vars["base_domain"] == "example.com"
     assert all_vars["derived_domain"] == "ops.example.com"
     assert vault_vars["vault_demo_password"]
-    assert (repo_root / "reports/bootstrap-ssh/demo-01").exists()
-    assert (repo_root / "reports/bootstrap-ssh/demo-01.pub").exists()
-    public_key = (repo_root / "reports/bootstrap-ssh/demo-01.pub").read_text(encoding="utf-8").strip()
+    state_dir = state_root / "sample" / "repo"
+    assert (state_dir / "bootstrap-ssh/demo-01").exists()
+    assert (state_dir / "bootstrap-ssh/demo-01.pub").exists()
+    public_key = (state_dir / "bootstrap-ssh/demo-01.pub").read_text(encoding="utf-8").strip()
     assert public_key.endswith("deploy@demo-01")
     assert public_key.count("deploy@demo-01") == 1
-    assert any(path.name.startswith("config-wizard-state-") for path in (repo_root / "reports").iterdir())
+    assert any(path.name == "config-wizard-state.yml" for path in state_dir.glob("runs/*/config-wizard-state.yml"))
+
+
+def test_evaluate_condition_rejects_unsafe_code() -> None:
+    with pytest.raises(WizardError):
+        evaluate_condition("__import__('os').system('true')", {"enabled": True})

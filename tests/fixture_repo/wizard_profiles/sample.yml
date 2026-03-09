@@ -34,7 +34,7 @@ sections:
           kind: generate
           generator: ed25519_keypair
           params:
-            path_template: reports/bootstrap-ssh/{{ host_name }}
+            path_template: "{{ wizard_state_dir }}/bootstrap-ssh/{{ host_name }}"
             comment_template: "{{ ansible_user }}@{{ host_name }}"
     actions:
       - kind: pause

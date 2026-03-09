@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
 import copy
 import json
+import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +30,27 @@ class WizardPaused(RuntimeError):
     pass
 
 
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-").lower()
+    return slug or "default"
+
+
+def default_state_home() -> Path:
+    override = os.environ.get("ANSIBLE_CONFIG_WIZARD_STATE_HOME")
+    if override:
+        return Path(override).expanduser().resolve()
+    xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    if xdg_state_home:
+        return Path(xdg_state_home).expanduser().resolve() / "ansible-config-wizard"
+    return (Path.home() / ".local" / "state" / "ansible-config-wizard").resolve()
+
+
+def ensure_private_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
 def load_profile(path: Path) -> ProfileModel:
     with path.open("r", encoding="utf-8") as handle:
         return ProfileModel.model_validate(yaml.safe_load(handle))
@@ -39,12 +63,60 @@ def load_answers(path: Path | None) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
+def evaluate_ast_expression(node: ast.AST, context: dict[str, Any]) -> Any:
+    if isinstance(node, ast.Expression):
+        return evaluate_ast_expression(node.body, context)
+    if isinstance(node, ast.Name):
+        return context.get(node.id)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.List):
+        return [evaluate_ast_expression(item, context) for item in node.elts]
+    if isinstance(node, ast.Tuple):
+        return tuple(evaluate_ast_expression(item, context) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return {
+            evaluate_ast_expression(key, context): evaluate_ast_expression(value, context)
+            for key, value in zip(node.keys, node.values, strict=True)
+        }
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not bool(evaluate_ast_expression(node.operand, context))
+    if isinstance(node, ast.BoolOp):
+        values = [bool(evaluate_ast_expression(value, context)) for value in node.values]
+        if isinstance(node.op, ast.And):
+            return all(values)
+        if isinstance(node.op, ast.Or):
+            return any(values)
+    if isinstance(node, ast.Compare):
+        left = evaluate_ast_expression(node.left, context)
+        for operator, comparator in zip(node.ops, node.comparators, strict=True):
+            right = evaluate_ast_expression(comparator, context)
+            if isinstance(operator, ast.Eq):
+                result = left == right
+            elif isinstance(operator, ast.NotEq):
+                result = left != right
+            elif isinstance(operator, ast.In):
+                result = left in right
+            elif isinstance(operator, ast.NotIn):
+                result = left not in right
+            elif isinstance(operator, ast.Is):
+                result = left is right
+            elif isinstance(operator, ast.IsNot):
+                result = left is not right
+            else:
+                raise WizardError(f"Unsupported condition operator: {ast.dump(operator)}")
+            if not result:
+                return False
+            left = right
+        return True
+    raise WizardError(f"Unsupported condition expression: {ast.dump(node)}")
+
+
 def evaluate_condition(expression: str | None, context: dict[str, Any]) -> bool:
     if not expression:
         return True
-    safe_globals = {"__builtins__": {}}
-    safe_locals = copy.deepcopy(context)
-    return bool(eval(expression, safe_globals, safe_locals))
+    tree = ast.parse(expression, mode="eval")
+    return bool(evaluate_ast_expression(tree, copy.deepcopy(context)))
 
 
 def render_template_string(template: str | None, context: dict[str, Any]) -> Any:
@@ -145,6 +217,7 @@ def materialize_generated_value(
     base_path = Path(render_template_string(path_template, context))
     if not base_path.is_absolute():
         base_path = repo_root / base_path
+    ensure_private_dir(base_path.parent)
     public_path = base_path.with_name(f"{base_path.name}.pub")
 
     backup_existing(base_path)
@@ -270,7 +343,8 @@ def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: 
 
 
 def write_resume_state(repo_root: Path, context: dict[str, Any]) -> Path:
-    path = repo_root / "reports" / f"config-wizard-state-{context['timestamp']}.yml"
+    path = Path(context["wizard_run_dir"]) / "config-wizard-state.yml"
+    ensure_private_dir(path.parent)
     atomic_write(path, yaml.safe_dump(context, sort_keys=False), 0o600)
     return path
 
@@ -332,6 +406,13 @@ def indent_text(value: Any, indent: int = 0) -> str:
     return "\n".join(prefix + line if line else prefix for line in lines)
 
 
+def display_path(path: Path, repo_root: Path) -> str:
+    try:
+        return str(path.relative_to(repo_root))
+    except ValueError:
+        return str(path)
+
+
 def build_environment(template_root: Path) -> Environment:
     environment = Environment(
         loader=FileSystemLoader(str(template_root)),
@@ -372,7 +453,8 @@ def sanitize_for_log(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_audit_log(repo_root: Path, context: dict[str, Any]) -> Path:
-    path = repo_root / "reports" / f"config-wizard-{context['timestamp']}.json"
+    path = Path(context["wizard_run_dir"]) / "config-wizard-audit.json"
+    ensure_private_dir(path.parent)
     payload = {
         "generated_at": context["timestamp"],
         "profile": context["profile_id"],
@@ -430,6 +512,15 @@ def run_wizard(
     context: dict[str, Any] = copy.deepcopy(profile.defaults)
     context["profile_id"] = profile.id
     context["timestamp"] = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    context["repo_root"] = str(repo_root)
+    state_home = default_state_home()
+    context["wizard_state_home"] = str(state_home)
+    context["wizard_state_dir"] = str(
+        ensure_private_dir(state_home / slugify(profile.id) / slugify(repo_root.name))
+    )
+    context["wizard_run_dir"] = str(
+        ensure_private_dir(Path(context["wizard_state_dir"]) / "runs" / context["timestamp"])
+    )
 
     console.print(Panel.fit(f"{profile.name}\nProfile: {profile.id}", border_style="green"))
 
@@ -473,12 +564,12 @@ def run_wizard(
     for output, content in rendered_outputs:
         target_path = repo_root / render_template_string(output.path, built)
         atomic_write(target_path, content.rstrip() + "\n", int(output.mode, 8))
-        console.print(f"[green]Wrote[/green] {target_path.relative_to(repo_root)}")
+        console.print(f"[green]Wrote[/green] {display_path(target_path, repo_root)}")
 
     log_path = None
     if write_log:
         log_path = write_audit_log(repo_root, built)
-        console.print(f"[green]Wrote[/green] {log_path.relative_to(repo_root)}")
+        console.print(f"[green]Wrote[/green] {display_path(log_path, repo_root)}")
 
     encrypt_vault = encrypt_override if encrypt_override is not None else maybe_prompt_option(
         provided_answers,

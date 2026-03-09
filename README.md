@@ -23,6 +23,12 @@ This package owns the generic workflow:
 - optional `ansible-vault` encryption
 - optional post-write preflight execution
 
+Secret-bearing runtime artifacts such as generated bootstrap SSH keys, resume-state files, and audit logs default to the local state directory, not the repo checkout:
+
+- `$ANSIBLE_CONFIG_WIZARD_STATE_HOME` when set
+- otherwise `$XDG_STATE_HOME/ansible-config-wizard`
+- otherwise `~/.local/state/ansible-config-wizard`
+
 Consumer repositories own their deployment-specific pieces:
 
 - wizard profile YAML
