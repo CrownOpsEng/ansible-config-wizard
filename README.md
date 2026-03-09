@@ -29,6 +29,16 @@ Secret-bearing runtime artifacts such as generated bootstrap SSH keys, resume-st
 - otherwise `$XDG_STATE_HOME/ansible-config-wizard`
 - otherwise `~/.local/state/ansible-config-wizard`
 
+When a consumer profile wants the wizard to manage the long-term Ansible SSH identity, it should point the key path at `{{ wizard_ssh_dir }}`, which defaults to:
+
+- `$ANSIBLE_CONFIG_WIZARD_SSH_HOME/<repo>` when `ANSIBLE_CONFIG_WIZARD_SSH_HOME` is set
+- otherwise `~/.ssh/ansible-config-wizard/<repo>`
+
+Wizard-generated resume-state files are best-effort securely deleted after a successful resumed run:
+
+- `shred --remove --zero` when `shred` is available
+- otherwise an overwrite-and-unlink fallback
+
 Consumer repositories own their deployment-specific pieces:
 
 - wizard profile YAML

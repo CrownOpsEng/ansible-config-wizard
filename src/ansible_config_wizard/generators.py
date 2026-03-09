@@ -4,6 +4,7 @@ import base64
 import hashlib
 import secrets
 import string
+from pathlib import Path
 from typing import Any
 
 from cryptography.hazmat.primitives import serialization
@@ -49,6 +50,26 @@ def generate_ed25519_keypair(comment: str | None = None) -> dict[str, str]:
         public_bytes = f"{public_bytes} {comment}"
     return {
         "private_key": private_bytes,
+        "public_key": public_bytes,
+        "fingerprint": fingerprint(public_bytes),
+    }
+
+
+def load_ed25519_keypair(private_key_path: Path, public_key_path: Path | None = None) -> dict[str, str]:
+    private_bytes = private_key_path.read_bytes()
+    private_key = serialization.load_ssh_private_key(private_bytes, password=None)
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH,
+        format=serialization.PublicFormat.OpenSSH,
+    ).decode("utf-8")
+
+    if public_key_path and public_key_path.exists():
+        public_text = public_key_path.read_text(encoding="utf-8").strip()
+        if public_text:
+            public_bytes = public_text
+
+    return {
+        "private_key": private_bytes.decode("utf-8"),
         "public_key": public_bytes,
         "fingerprint": fingerprint(public_bytes),
     }

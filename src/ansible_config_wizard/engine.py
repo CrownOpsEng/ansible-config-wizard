@@ -16,10 +16,10 @@ from jinja2 import Environment, FileSystemLoader
 from rich.console import Console
 from rich.panel import Panel
 
-from .generators import generate_value
+from .generators import generate_value, load_ed25519_keypair
 from .models import ActionModel, FieldModel, OutputModel, ProfileModel, SectionModel
 from .resolver import resolve_builder
-from .writers import atomic_write, backup_existing
+from .writers import atomic_write, backup_existing, secure_delete
 
 
 class WizardError(RuntimeError):
@@ -43,6 +43,13 @@ def default_state_home() -> Path:
     if xdg_state_home:
         return Path(xdg_state_home).expanduser().resolve() / "ansible-config-wizard"
     return (Path.home() / ".local" / "state" / "ansible-config-wizard").resolve()
+
+
+def default_ssh_home() -> Path:
+    override = os.environ.get("ANSIBLE_CONFIG_WIZARD_SSH_HOME")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (Path.home() / ".ssh" / "ansible-config-wizard").resolve()
 
 
 def ensure_private_dir(path: Path) -> Path:
@@ -203,7 +210,6 @@ def materialize_generated_value(
     if field.type != "ssh_keypair" or not isinstance(value, dict):
         return value
 
-    path_template = field.source.params.get("path_template")
     comment_template = field.source.params.get("comment_template")
     rendered_comment = render_template_string(comment_template, context) if comment_template else None
     if rendered_comment and not value.get("public_key", "").strip().endswith(rendered_comment):
@@ -211,6 +217,7 @@ def materialize_generated_value(
         value["public_key"] = f"{value['public_key']} {comment}".strip()
         value["fingerprint"] = value["fingerprint"]
 
+    path_template = field.source.params.get("path_template")
     if not path_template:
         return value
 
@@ -220,8 +227,6 @@ def materialize_generated_value(
     ensure_private_dir(base_path.parent)
     public_path = base_path.with_name(f"{base_path.name}.pub")
 
-    backup_existing(base_path)
-    backup_existing(public_path)
     atomic_write(base_path, value["private_key"].rstrip() + "\n", 0o600)
     atomic_write(public_path, value["public_key"].rstrip() + "\n", 0o644)
 
@@ -246,8 +251,21 @@ def resolve_field(
     source = field.source
     if source.kind == "generate":
         generator_params = copy.deepcopy(source.params)
-        if field.type == "ssh_keypair" and source.params.get("comment_template"):
-            generator_params["comment"] = render_template_string(source.params["comment_template"], context)
+        if field.type == "ssh_keypair":
+            path_template = source.params.get("path_template")
+            if path_template:
+                base_path = Path(render_template_string(path_template, context))
+                if not base_path.is_absolute():
+                    base_path = repo_root / base_path
+                public_path = base_path.with_name(f"{base_path.name}.pub")
+                if source.params.get("reuse_existing", True) and base_path.exists():
+                    value = load_ed25519_keypair(base_path, public_path)
+                    value["private_key_path"] = str(base_path)
+                    value["public_key_path"] = str(public_path)
+                    console.print(f"[cyan]Using existing[/cyan] {field.label}.")
+                    return value
+            if source.params.get("comment_template"):
+                generator_params["comment"] = render_template_string(source.params["comment_template"], context)
         value = generate_value(source.generator or "password", generator_params)
         value = materialize_generated_value(field, value, context, repo_root)
         console.print(f"[green]Generated[/green] {field.label}.")
@@ -342,8 +360,8 @@ def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: 
     context[collection_key] = items
 
 
-def write_resume_state(repo_root: Path, context: dict[str, Any]) -> Path:
-    path = Path(context["wizard_run_dir"]) / "config-wizard-state.yml"
+def write_resume_state(context: dict[str, Any]) -> Path:
+    path = Path(context["wizard_resume_state_path"])
     ensure_private_dir(path.parent)
     atomic_write(path, yaml.safe_dump(context, sort_keys=False), 0o600)
     return path
@@ -360,14 +378,11 @@ def run_section_actions(
         if not evaluate_condition(action.when, context):
             continue
 
-        if action.save_state:
-            context["resume_state_path"] = str(write_resume_state(repo_root, context))
+        if assume_yes:
+            continue
 
         message = render_template_string(action.message_template, context)
         console.print(Panel(message, title=section.title, border_style="yellow", expand=False))
-
-        if assume_yes:
-            continue
 
         choice = questionary.select(
             action.prompt,
@@ -375,7 +390,10 @@ def run_section_actions(
             default="Continue now",
         ).ask()
         if choice == "Exit and resume later":
-            resume_state_path = context.get("resume_state_path", "")
+            resume_state_path = ""
+            if action.save_state:
+                resume_state_path = str(write_resume_state(context))
+                context["resume_state_path"] = resume_state_path
             if resume_state_path:
                 console.print(
                     f"[yellow]Resume later with:[/yellow] [bold]--answers-file {resume_state_path}[/bold]"
@@ -464,6 +482,19 @@ def write_audit_log(repo_root: Path, context: dict[str, Any]) -> Path:
     return path
 
 
+def cleanup_generated_resume_state(answers_path: Path | None, context: dict[str, Any], console: Console) -> None:
+    if answers_path is None:
+        return
+    resolved_answers = answers_path.resolve()
+    wizard_state_dir = Path(context["wizard_state_dir"])
+    if resolved_answers.name != "config-wizard-state.yml":
+        return
+    if not resolved_answers.is_relative_to(wizard_state_dir):
+        return
+    secure_delete(resolved_answers)
+    console.print(f"[cyan]Deleted[/cyan] {resolved_answers}")
+
+
 def encrypt_vault_file(repo_root: Path, vault_password_file: str | None, console: Console) -> None:
     vault_path = repo_root / "inventories/prod/group_vars/vault.yml"
     command = ["ansible-vault", "encrypt", str(vault_path)]
@@ -518,9 +549,13 @@ def run_wizard(
     context["wizard_state_dir"] = str(
         ensure_private_dir(state_home / slugify(profile.id) / slugify(repo_root.name))
     )
+    context["wizard_ssh_dir"] = str(
+        ensure_private_dir(default_ssh_home() / slugify(repo_root.name))
+    )
     context["wizard_run_dir"] = str(
         ensure_private_dir(Path(context["wizard_state_dir"]) / "runs" / context["timestamp"])
     )
+    context["wizard_resume_state_path"] = str(Path(context["wizard_run_dir"]) / "config-wizard-state.yml")
 
     console.print(Panel.fit(f"{profile.name}\nProfile: {profile.id}", border_style="green"))
 
@@ -591,6 +626,8 @@ def run_wizard(
     )
     if run_preflight_now:
         run_preflight(repo_root, console)
+
+    cleanup_generated_resume_state(answers_path, built, console)
 
     console.print(Panel.fit("Configuration wizard complete.", border_style="green"))
     if write_details:

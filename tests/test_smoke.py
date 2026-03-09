@@ -15,8 +15,18 @@ def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
     shutil.copytree(fixture_root, tmp_path / "repo", dirs_exist_ok=True)
     repo_root = tmp_path / "repo"
     state_root = tmp_path / "state-home"
+    ssh_root = tmp_path / "ssh-home"
     monkeypatch.setenv("ANSIBLE_CONFIG_WIZARD_STATE_HOME", str(state_root))
+    monkeypatch.setenv("ANSIBLE_CONFIG_WIZARD_SSH_HOME", str(ssh_root))
 
+    run_wizard(
+        profile_path=repo_root / "wizard_profiles" / "sample.yml",
+        repo_root=repo_root,
+        answers_path=repo_root / "answers.yml",
+        assume_yes=True,
+        encrypt_override=False,
+        preflight_override=False,
+    )
     run_wizard(
         profile_path=repo_root / "wizard_profiles" / "sample.yml",
         repo_root=repo_root,
@@ -37,13 +47,13 @@ def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
     assert all_vars["base_domain"] == "example.com"
     assert all_vars["derived_domain"] == "ops.example.com"
     assert vault_vars["vault_demo_password"]
-    state_dir = state_root / "sample" / "repo"
-    assert (state_dir / "bootstrap-ssh/demo-01").exists()
-    assert (state_dir / "bootstrap-ssh/demo-01.pub").exists()
-    public_key = (state_dir / "bootstrap-ssh/demo-01.pub").read_text(encoding="utf-8").strip()
+    ssh_dir = ssh_root / "repo"
+    assert (ssh_dir / "demo-01").exists()
+    assert (ssh_dir / "demo-01.pub").exists()
+    public_key = (ssh_dir / "demo-01.pub").read_text(encoding="utf-8").strip()
     assert public_key.endswith("deploy@demo-01")
     assert public_key.count("deploy@demo-01") == 1
-    assert any(path.name == "config-wizard-state.yml" for path in state_dir.glob("runs/*/config-wizard-state.yml"))
+    assert not any(path.name == "config-wizard-state.yml" for path in state_root.glob("sample/repo/runs/*/config-wizard-state.yml"))
 
 
 def test_evaluate_condition_rejects_unsafe_code() -> None:
