@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ansible-config-wizard"
+version = "0.1.0"
+description = "Reusable local configuration wizard for Ansible deployment repos"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "cryptography>=44.0.0",
+  "jinja2>=3.1.5",
+  "pydantic>=2.10.6",
+  "pyyaml>=6.0.2",
+  "questionary>=2.1.0",
+  "rich>=13.9.4",
+  "typer>=0.15.2",
+]
+
+[project.scripts]
+ansible-config-wizard = "ansible_config_wizard.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ansible_config_wizard"]

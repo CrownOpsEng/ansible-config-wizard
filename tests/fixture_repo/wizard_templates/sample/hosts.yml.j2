@@ -1,0 +1,8 @@
+---
+all:
+  children:
+    core_hosts:
+      hosts:
+        {{ host_name }}:
+          ansible_host: {{ ansible_host | yaml_value }}
+          ansible_user: {{ ansible_user | yaml_value }}

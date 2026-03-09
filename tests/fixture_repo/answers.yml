@@ -1,0 +1,4 @@
+host_name: demo-01
+ansible_host: 203.0.113.10
+ansible_user: deploy
+base_domain: example.com

@@ -1,0 +1,40 @@
+id: sample
+name: Sample Wizard Profile
+builder: wizard_support.builders:build_sample_context
+defaults:
+  ansible_user: deploy
+sections:
+  - id: basics
+    title: Basics
+    fields:
+      - id: host_name
+        label: Host name
+        required: true
+      - id: ansible_host
+        label: Ansible host
+        required: true
+      - id: ansible_user
+        label: Ansible user
+        default: deploy
+      - id: base_domain
+        label: Base domain
+        required: true
+      - id: vault_demo_password
+        label: Demo password
+        secret: true
+        source:
+          kind: generate
+          generator: password
+          params:
+            length: 24
+outputs:
+  - id: hosts
+    path: inventories/prod/hosts.yml
+    template: wizard_templates/sample/hosts.yml.j2
+  - id: all
+    path: inventories/prod/group_vars/all.yml
+    template: wizard_templates/sample/all.yml.j2
+  - id: vault
+    path: inventories/prod/group_vars/vault.yml
+    template: wizard_templates/sample/vault.yml.j2
+    mode: "0600"
