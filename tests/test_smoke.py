@@ -253,7 +253,7 @@ def test_local_command_action_exposes_profile_defined_choices() -> None:
         default_choice="run",
     )
 
-    assert local_command_choice_labels(action) == ["Run now", "Leave for later"]
+    assert local_command_choice_labels(action) == ["Run now", "Skip this step and continue"]
     assert local_command_choice_default(action) == "Run now"
 
 
@@ -313,7 +313,7 @@ def test_local_command_menu_expands_run_choice_into_top_level_options() -> None:
         "Show commands",
         "Run deployment",
         "Set up prerequisites",
-        "Leave for later",
+        "Skip this step and continue",
     ]
     assert local_command_menu_default(action, options) == "Run deployment"
 
@@ -376,7 +376,7 @@ def test_build_ssh_setup_commands_disables_agent_keys() -> None:
         ssh_user="ubuntu",
         public_key_path="/tmp/test key.pub",
         private_key_path="/tmp/test key",
-        resume_command="./scripts/configure.sh --answers-file /tmp/state.yml",
+        resume_command="./scripts/setup.sh --answers-file /tmp/state.yml",
     )
 
     assert "ssh-copy-id" in commands
@@ -540,6 +540,8 @@ def test_next_navigation_choices_prioritize_local_continue() -> None:
         "Continue to Step 3: Three",
         "Resume at Step 4: Four",
         "Review a step",
+        "Save progress and exit",
+        "Exit without saving progress",
     ]
 
 
@@ -594,6 +596,12 @@ def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -
                 raise KeyboardInterrupt
             return "continue"
 
+    class FakeSelect:
+        def ask(self) -> str:
+            return "Save and exit"
+
+    monkeypatch.setattr("ansible_config_wizard.engine.questionary.select", lambda *args, **kwargs: FakeSelect())
+
     state_path = tmp_path / "config-wizard-state.yml"
     context = {
         "wizard_resume_enabled": True,
@@ -602,21 +610,23 @@ def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -
     }
     console = Console(file=Buffer(), force_terminal=False, color_system=None)
 
-    answer = ask_question(InterruptThenAnswer(), context, console)
-
-    assert answer == "continue"
+    with pytest.raises(WizardPaused):
+        ask_question(InterruptThenAnswer(), context, console)
     assert state_path.exists()
     saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
     assert saved["wizard_resume_section_index"] == 2
 
 
-def test_ask_question_exits_on_second_consecutive_interrupt(tmp_path: Path, monkeypatch) -> None:
+def test_ask_question_exits_without_saving_from_interrupt_menu(tmp_path: Path, monkeypatch) -> None:
     class AlwaysInterrupt:
         def ask(self) -> str:
             raise KeyboardInterrupt
 
-    ticks = iter([10.0, 11.0])
-    monkeypatch.setattr("ansible_config_wizard.engine.monotonic", lambda: next(ticks))
+    class FakeSelect:
+        def ask(self) -> str:
+            return "Exit without saving"
+
+    monkeypatch.setattr("ansible_config_wizard.engine.questionary.select", lambda *args, **kwargs: FakeSelect())
 
     state_path = tmp_path / "config-wizard-state.yml"
     context = {
@@ -629,7 +639,7 @@ def test_ask_question_exits_on_second_consecutive_interrupt(tmp_path: Path, monk
     with pytest.raises(WizardPaused):
         ask_question(AlwaysInterrupt(), context, console)
 
-    assert state_path.exists()
+    assert not state_path.exists()
 
 
 def test_ask_question_treats_none_as_interrupt(tmp_path: Path, monkeypatch) -> None:
@@ -643,6 +653,12 @@ def test_ask_question_treats_none_as_interrupt(tmp_path: Path, monkeypatch) -> N
                 return None
             return "continue"
 
+    class FakeSelect:
+        def ask(self) -> str:
+            return "Continue editing"
+
+    monkeypatch.setattr("ansible_config_wizard.engine.questionary.select", lambda *args, **kwargs: FakeSelect())
+
     state_path = tmp_path / "config-wizard-state.yml"
     context = {
         "wizard_resume_enabled": True,
@@ -654,4 +670,4 @@ def test_ask_question_treats_none_as_interrupt(tmp_path: Path, monkeypatch) -> N
     answer = ask_question(NoneThenAnswer(), context, console)
 
     assert answer == "continue"
-    assert state_path.exists()
+    assert not state_path.exists()

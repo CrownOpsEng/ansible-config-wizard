@@ -38,6 +38,17 @@ class WizardPaused(RuntimeError):
     pass
 
 
+def clear_resume_state(context: dict[str, Any], console: Console) -> None:
+    resume_state = context.get("wizard_resume_state_path")
+    if not resume_state:
+        return
+    path = Path(str(resume_state))
+    if not path.exists():
+        return
+    secure_delete(path)
+    console.print(f"[cyan]Deleted[/cyan] {path}")
+
+
 class RedactingConsoleWriter:
     def __init__(self, console: Console, secrets: list[str] | None = None) -> None:
         self.console = console
@@ -154,26 +165,41 @@ def persist_progress(context: dict[str, Any], section_index: int | None = None) 
     return write_resume_state(context, section_index)
 
 
-def exit_on_interrupt(context: dict[str, Any], console: Console) -> None:
+def save_and_exit(context: dict[str, Any], console: Console) -> None:
     resume_state_path = persist_progress(context)
     console.print()
     if resume_state_path is not None:
         console.print(f"[yellow]Progress saved to:[/yellow] [bold]{resume_state_path}[/bold]")
         console.print(f"[yellow]Resume later with:[/yellow] [bold]--answers-file {resume_state_path}[/bold]")
-    raise WizardPaused("Wizard interrupted by operator.")
+    raise WizardPaused("Wizard paused by operator.")
+
+
+def exit_without_saving(context: dict[str, Any], console: Console) -> None:
+    clear_resume_state(context, console)
+    console.print()
+    console.print("[yellow]Exiting without saving resume state.[/yellow]")
+    raise WizardPaused("Wizard exited without saving progress.")
 
 
 def handle_prompt_interrupt(context: dict[str, Any], console: Console) -> None:
-    interrupted_at = monotonic()
-    last_interrupt = float(context.get("wizard_last_interrupt_at", 0.0))
-    if interrupted_at - last_interrupt <= 2.5:
-        exit_on_interrupt(context, console)
-    resume_state_path = persist_progress(context)
     console.print()
-    if resume_state_path is not None:
-        console.print(f"[yellow]Progress saved to:[/yellow] [bold]{resume_state_path}[/bold]")
-    console.print("[yellow]Press Ctrl-C again to exit, or continue with this step.[/yellow]")
-    context["wizard_last_interrupt_at"] = interrupted_at
+    console.print("[bold]Interrupt options[/bold]", style="yellow")
+    choice = questionary.select(
+        "What do you want to do?",
+        choices=[
+            "Continue editing",
+            "Save and exit",
+            "Exit without saving",
+        ],
+        default="Continue editing",
+    ).ask()
+    console.print()
+    if choice in (None, "Continue editing"):
+        context["wizard_last_interrupt_at"] = monotonic()
+        return
+    if choice == "Save and exit":
+        save_and_exit(context, console)
+    exit_without_saving(context, console)
 
 
 def ask_question(prompt: Any, context: dict[str, Any], console: Console) -> Any:
@@ -331,9 +357,41 @@ def text_like_question(
     kwargs = {"key_bindings": build_restore_default_bindings(restore_value)}
     if field_type == "password":
         return questionary.password(prompt, default=default_value, **kwargs)
-    if field_type == "multiline_text":
-        return questionary.text(prompt, default=default_value, multiline=True, **kwargs)
     return questionary.text(prompt, default=default_value, **kwargs)
+
+
+def prompt_multiline_value(
+    field: FieldModel,
+    display_default: Any,
+    prompt_default: Any,
+    console: Console,
+    context: dict[str, Any],
+) -> str:
+    existing_value = "" if prompt_default in (None, [], {}) else str(prompt_default)
+    if existing_value.strip():
+        keep_existing = ask_question(
+            questionary.confirm(
+                f"{field.label}: keep the existing/default lines?",
+                default=True,
+            ),
+            context,
+            console,
+        )
+        console.print()
+        if keep_existing:
+            return existing_value.strip()
+
+    console.print("Enter one line per prompt. Submit a blank line when you are finished.", style="dim")
+    lines: list[str] = []
+    line_number = 1
+    while True:
+        line = ask_question(questionary.text(f"{field.label} [{line_number}]"), context, console)
+        if not line:
+            break
+        lines.append(str(line).rstrip())
+        line_number += 1
+    console.print()
+    return "\n".join(lines).strip()
 
 
 def prompt_field(
@@ -348,7 +406,7 @@ def prompt_field(
     if field.help:
         console.print(field.help, style="dim")
     if field.type == "multiline_text":
-        console.print("Paste one line per entry. Press Esc to restore the default buffer.", style="dim")
+        return prompt_multiline_value(field, display_default, prompt_default, console, context)
     if display_default not in (None, "", [], {}) and field.type not in {"confirm", "password", "ssh_keypair"}:
         console.print(f"Default: {display_default}", style="dim")
     if field.type == "confirm":
@@ -369,19 +427,6 @@ def prompt_field(
                 prompt,
                 str(prompt_default or ""),
                 str(display_default or ""),
-            ),
-            context,
-            console,
-        )
-        console.print()
-        return value
-    if field.type == "multiline_text":
-        value = ask_question(
-            text_like_question(
-                field.type,
-                prompt,
-                "" if prompt_default is None else str(prompt_default),
-                "" if display_default is None else str(display_default),
             ),
             context,
             console,
@@ -986,14 +1031,14 @@ def describe_next_step(profile: ProfileModel, context: dict[str, Any], current_i
                 1 for item in profile.sections[: index + 1] if evaluate_condition(item.when, context)
             )
             return f"Continue to Step {step_number}: {section.title}"
-    return "Continue to final output options"
+    return "Continue to setup stages"
 
 
 def describe_step_target(profile: ProfileModel, context: dict[str, Any], current_index: int) -> str:
     label = describe_next_step(profile, context, current_index)
     if label.startswith("Continue to "):
         return label.removeprefix("Continue to ")
-    return "final output options"
+    return "setup stages"
 
 
 def choose_resume_section(
@@ -1047,6 +1092,8 @@ def next_navigation_choices(profile: ProfileModel, context: dict[str, Any], curr
 
     if completed_visible_sections(profile.sections, context, resume_index - 1):
         choices.append("Review a step")
+    choices.append("Save progress and exit")
+    choices.append("Exit without saving progress")
     return choices
 
 
@@ -1266,7 +1313,7 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
     public_key_path = render_template_string(action.public_key_path_template, context)
     private_key_path = render_template_string(action.private_key_path_template, context)
     port = context.get("ansible_port", 22)
-    resume_command = f"./scripts/configure.sh --answers-file {context['wizard_resume_state_path']}"
+    resume_command = f"./scripts/setup.sh --answers-file {context['wizard_resume_state_path']}"
     commands = (
         render_template_string(action.commands_template, context).strip()
         if action.commands_template
@@ -1309,7 +1356,8 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
                     "Install now (recommended)",
                     "Show manual steps",
                     "I already finished this, continue",
-                    "Pause here and resume later",
+                    "Save progress and exit",
+                    "Exit without saving progress",
                 ],
                 default="Install now (recommended)",
             ),
@@ -1341,7 +1389,8 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
                         choices=[
                             "Show manual steps",
                             "Try automatic install again",
-                            "Pause here and resume later",
+                            "Save progress and exit",
+                            "Exit without saving progress",
                         ],
                         default="Show manual steps",
                     ),
@@ -1350,8 +1399,10 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
                 )
                 if follow_up == "Try automatic install again":
                     continue
-                if follow_up == "Pause here and resume later":
-                    pause_wizard(action, context, console)
+                if follow_up == "Save progress and exit":
+                    save_and_exit(context, console)
+                if follow_up == "Exit without saving progress":
+                    exit_without_saving(context, console)
                 continue
             console.print("[green]Managed SSH key installed and verified.[/green]")
             console.print()
@@ -1362,8 +1413,10 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
         if choice == "Show manual steps":
             manual_requested = True
             continue
-        if choice == "Pause here and resume later":
-            pause_wizard(action, context, console)
+        if choice == "Save progress and exit":
+            save_and_exit(context, console)
+        if choice == "Exit without saving progress":
+            exit_without_saving(context, console)
         return
 
 
@@ -1396,14 +1449,20 @@ def run_section_actions(
         choice = ask_question(
             questionary.select(
                 action.prompt,
-                choices=["Continue now", "Exit and resume later"],
+                choices=[
+                    "Continue now",
+                    "Save progress and exit",
+                    "Exit without saving progress",
+                ],
                 default="Continue now",
             ),
             context,
             console,
         )
-        if choice == "Exit and resume later":
-            pause_wizard(action, context, console)
+        if choice == "Save progress and exit":
+            save_and_exit(context, console)
+        if choice == "Exit without saving progress":
+            exit_without_saving(context, console)
 
 
 def run_local_command(command: str, working_directory: Path | None, console: Console) -> None:
@@ -1420,7 +1479,7 @@ def run_local_command(command: str, working_directory: Path | None, console: Con
 LOCAL_COMMAND_LABELS = {
     "show": "Show command",
     "run": "Run now",
-    "leave": "Leave for later",
+    "leave": "Skip this step and continue",
 }
 
 
@@ -1443,7 +1502,7 @@ def local_command_menu_labels(action: ActionModel, options: list[dict[str, Any]]
         elif choice_name == "run":
             labels.extend(option["label"] for option in options)
         elif choice_name == "leave":
-            labels.append("Leave for later")
+            labels.append("Skip this step and continue")
     return labels
 
 
@@ -1454,7 +1513,7 @@ def local_command_menu_default(action: ActionModel, options: list[dict[str, Any]
         return options[0]["label"]
     if action.default_choice == "show":
         return "Show commands"
-    return "Leave for later"
+    return "Skip this step and continue"
 
 
 def resolve_local_command_options(
@@ -1538,7 +1597,7 @@ def run_local_command_action(
             console.print(f"[cyan]Prepared command file[/cyan] {command_path}")
             console.print()
         summary = "The wizard has prepared next-step command options." if len(options) > 1 else "The wizard has prepared the next-step command."
-        console.print(f"{summary} You can inspect it now, run it immediately, or leave it for later.", style="dim")
+        console.print(f"{summary} You can inspect it now, run it immediately, or skip it and continue.", style="dim")
         if len(options) > 1:
             console.print("[cyan]Available follow-up actions[/cyan]")
             for option in options:
@@ -1570,7 +1629,7 @@ def run_local_command_action(
         if choice in {"Show command", "Show commands"}:
             show_manual = True
             continue
-        if choice == "Leave for later":
+        if choice == "Skip this step and continue":
             return
         selected = next((option for option in options if option["label"] == choice), options[0])
         try:
@@ -1584,7 +1643,7 @@ def run_local_command_action(
                     choices=[
                         "Show command",
                         "Try again",
-                        "Leave for later",
+                        "Skip this step and continue",
                     ],
                     default="Show command",
                 ),
@@ -1594,7 +1653,7 @@ def run_local_command_action(
             console.print()
             if follow_up == "Try again":
                 continue
-            if follow_up == "Leave for later":
+            if follow_up == "Skip this step and continue":
                 return
             continue
         return
@@ -1864,7 +1923,7 @@ def prompt_for_vault_password_file(
 ) -> Path | None:
     console.print()
     console.print(
-        "Leave this blank to let Ansible prompt for the vault password interactively when needed.",
+        "Enter the path to an existing local vault password file. Leave this blank to go back.",
         style="dim",
     )
     default_value = str(prompt_default) if prompt_default is not None else ""
@@ -1883,6 +1942,7 @@ def prompt_for_vault_authentication(
     context: dict[str, Any],
     console: Console,
 ) -> Path | None:
+    managed_default = prompt_default or configured_vault_password_file_path(repo_root) or (repo_root / ".vault_pass")
     console.print()
     console.print(
         "Ansible needs vault access for this step. Choose whether to prompt for the vault password now or use a local password file.",
@@ -1893,7 +1953,8 @@ def prompt_for_vault_authentication(
             "How should Ansible unlock vault.yml?",
             choices=[
                 "Prompt for vault password interactively",
-                "Use vault password file",
+                "Use an existing vault password file",
+                f"Create managed default vault password file ({display_path(managed_default, repo_root)})",
             ],
             default="Prompt for vault password interactively",
         ),
@@ -1903,6 +1964,8 @@ def prompt_for_vault_authentication(
     console.print()
     if choice == "Prompt for vault password interactively":
         return None
+    if choice.startswith("Create managed default vault password file"):
+        return ensure_vault_password_file(managed_default, console)
     return prompt_for_vault_password_file(repo_root, prompt_default, context, console)
 
 
@@ -1970,6 +2033,299 @@ def run_preflight(repo_root: Path, console: Console, vault_password_file: Path |
         check=True,
         cwd=repo_root,
     )
+
+
+def wizard_vault_cli_args(context: dict[str, Any]) -> list[str]:
+    vault_password_file = context.get("vault_password_file")
+    if vault_password_file:
+        return ["--vault-password-file", str(vault_password_file)]
+    if context.get("vault_password_prompt_mode") == "ask":
+        return ["--ask-vault-pass"]
+    return []
+
+
+def run_shell_command(command: list[str], repo_root: Path, console: Console) -> None:
+    console.print("[cyan]Running[/cyan] " + " ".join(shlex.quote(part) for part in command), highlight=False)
+    subprocess.run(command, check=True, cwd=repo_root)
+
+
+def configure_vault_password_strategy(repo_root: Path, context: dict[str, Any], console: Console) -> None:
+    configured_default = configured_vault_password_file_path(repo_root) or (repo_root / ".vault_pass")
+    current_file = context.get("vault_password_file")
+    default_file = Path(str(current_file)) if current_file else configured_default
+    console.print(
+        "Choose how later stages should unlock vault.yml. This sets the vault behavior for encrypt, preflight, deploy, and SSH lockdown.",
+        style="dim",
+    )
+    choice = ask_question(
+        questionary.select(
+            "Vault password strategy",
+            choices=[
+                "Prompt for vault password interactively when needed",
+                "Use an existing vault password file",
+                f"Create managed default .vault_pass ({display_path(default_file, repo_root)})",
+            ],
+            default="Prompt for vault password interactively when needed",
+        ),
+        context,
+        console,
+    )
+    console.print()
+    if choice == "Prompt for vault password interactively when needed":
+        context["vault_password_file"] = None
+        context["vault_password_prompt_mode"] = "ask"
+        return
+    if choice.startswith("Create managed default .vault_pass"):
+        managed = ensure_vault_password_file(default_file, console)
+        context["vault_password_file"] = str(managed)
+        context["vault_password_prompt_mode"] = "file"
+        return
+    selected = prompt_for_vault_password_file(repo_root, default_file, context, console)
+    if selected is None:
+        raise WizardError("Vault password file selection was cancelled.")
+    context["vault_password_file"] = str(selected)
+    context["vault_password_prompt_mode"] = "file"
+
+
+def write_output_file(repo_root: Path, built: dict[str, Any], output: OutputModel, content: str, console: Console) -> Path:
+    target_path = repo_root / render_template_string(output.path, built)
+    backup_existing(target_path)
+    atomic_write(target_path, content.rstrip() + "\n", int(output.mode, 8))
+    console.print(f"[green]Wrote[/green] {display_path(target_path, repo_root)}")
+    return target_path
+
+
+def deploy_stage_command(stage_id: str, context: dict[str, Any]) -> list[str]:
+    command = [f"{context['repo_root']}/scripts/deploy.sh", "--skip-collections"]
+    if stage_id != "preflight":
+        command.append("--skip-preflight")
+    if stage_id != "bootstrap":
+        command.append("--skip-bootstrap")
+    if stage_id != "site":
+        command.append("--skip-site")
+    if stage_id != "backup":
+        command.append("--skip-backup")
+    command.extend(wizard_vault_cli_args(context))
+    return command
+
+
+def lockdown_stage_command(context: dict[str, Any], confirm: bool) -> list[str]:
+    command = [f"{context['repo_root']}/scripts/ssh-lockdown.sh"]
+    if confirm:
+        command.append("--confirm")
+    command.extend(wizard_vault_cli_args(context))
+    return command
+
+
+def runtime_stage_choices(default_label: str = "Run this stage now") -> list[str]:
+    return [
+        default_label,
+        "Skip this stage and continue",
+        "Return to configuration/review",
+        "Save progress and exit",
+        "Exit without saving progress",
+    ]
+
+
+def handle_runtime_stage_failure(context: dict[str, Any], console: Console, stage_label: str) -> str:
+    choice = ask_question(
+        questionary.select(
+            f"{stage_label} failed. What do you want to do next?",
+            choices=[
+                "Retry this stage",
+                "Return to configuration/review",
+                "Skip remaining stages",
+                "Save progress and exit",
+                "Exit without saving progress",
+            ],
+            default="Retry this stage",
+        ),
+        context,
+        console,
+    )
+    console.print()
+    if choice == "Save progress and exit":
+        save_and_exit(context, console)
+    if choice == "Exit without saving progress":
+        exit_without_saving(context, console)
+    if choice == "Skip remaining stages":
+        return "skip_remaining"
+    if choice == "Return to configuration/review":
+        return "review"
+    return "retry"
+
+
+def run_runtime_stages(
+    profile: ProfileModel,
+    context: dict[str, Any],
+    built: dict[str, Any],
+    rendered_outputs: list[tuple[OutputModel, str]],
+    repo_root: Path,
+    console: Console,
+) -> str:
+    vault_stage_output = next((item for item in rendered_outputs if item[0].id == "vault"), None)
+    vault_path = inventory_vault_path(repo_root)
+    stages = [
+        {
+            "id": "vault-strategy",
+            "title": "Stage 2: Vault password strategy",
+            "body": "Choose whether later stages should prompt for the vault password, reuse a local password file, or create the managed default .vault_pass file.",
+        },
+        {
+            "id": "vault-encrypt",
+            "title": "Stage 3: Encrypt or re-encrypt vault.yml",
+            "body": "Write the current vault answers, then restore Ansible Vault protection before any deployment stage runs.",
+        },
+        {
+            "id": "collections",
+            "title": "Stage 4: Install collections",
+            "body": "Install or refresh the required Ansible collections for this repo.",
+        },
+        {
+            "id": "preflight",
+            "title": "Stage 5: Preflight",
+            "body": "Validate the generated inventory, secrets wiring, and deployment contract before changing the host.",
+        },
+        {
+            "id": "bootstrap",
+            "title": "Stage 6: Bootstrap",
+            "body": "Prepare the host foundation and steady-state access path.",
+        },
+        {
+            "id": "site",
+            "title": "Stage 7: Site deploy",
+            "body": "Apply the enabled application and service configuration.",
+        },
+        {
+            "id": "backup",
+            "title": "Stage 8: Backup setup",
+            "body": "Configure the scheduled backup jobs and maintenance tasks.",
+        },
+        {
+            "id": "ssh-lockdown",
+            "title": "Stage 9: Optional SSH lockdown",
+            "body": "Optionally run the staged SSH lockdown after you have confirmed your restrictive access path.",
+        },
+    ]
+    stage_index = int(context.get("wizard_runtime_stage_index", 0))
+    while stage_index < len(stages):
+        stage = stages[stage_index]
+        console.print(Rule(f"[bold cyan]{stage['title']}[/bold cyan]"))
+        console.print(stage["body"], style="dim")
+        console.print()
+        action = ask_question(
+            questionary.select(
+                "What do you want to do?",
+                choices=runtime_stage_choices(),
+                default="Run this stage now",
+            ),
+            context,
+            console,
+        )
+        console.print()
+        if action == "Skip this stage and continue":
+            stage_index += 1
+            context["wizard_runtime_stage_index"] = stage_index
+            persist_progress(context, len(profile.sections))
+            continue
+        if action == "Return to configuration/review":
+            return "review"
+        if action == "Save progress and exit":
+            save_and_exit(context, console)
+        if action == "Exit without saving progress":
+            exit_without_saving(context, console)
+
+        try:
+            if stage["id"] == "vault-strategy":
+                configure_vault_password_strategy(repo_root, context, console)
+            elif stage["id"] == "vault-encrypt":
+                if vault_stage_output is None:
+                    console.print("[yellow]No vault output is defined for this profile.[/yellow]")
+                else:
+                    output, content = vault_stage_output
+                    if context.get("wizard_existing_vault_was_encrypted"):
+                        replace_existing = ask_question(
+                            questionary.select(
+                                "vault.yml was already encrypted before this run. What do you want to do?",
+                                choices=[
+                                    "Replace the existing vault with the regenerated values",
+                                    "Keep the existing encrypted vault and continue",
+                                    "Return to the stage menu",
+                                ],
+                                default="Replace the existing vault with the regenerated values",
+                            ),
+                            context,
+                            console,
+                        )
+                        console.print()
+                        if replace_existing == "Return to the stage menu":
+                            continue
+                        if replace_existing == "Keep the existing encrypted vault and continue":
+                            stage_index += 1
+                            context["wizard_runtime_stage_index"] = stage_index
+                            persist_progress(context, len(profile.sections))
+                            continue
+                    write_output_file(repo_root, built, output, content, console)
+                    encrypted_vault_password_file = finalize_vault_password_file(
+                        repo_root,
+                        context.get("vault_password_file"),
+                        False,
+                        context,
+                        console,
+                        needs_prompt=True,
+                        requires_noninteractive_value=False,
+                    )
+                    if encrypted_vault_password_file is not None:
+                        context["vault_password_file"] = str(encrypted_vault_password_file)
+                        context["vault_password_prompt_mode"] = "file"
+                    elif not context.get("vault_password_prompt_mode"):
+                        context["vault_password_prompt_mode"] = "ask"
+                    encrypt_vault_file(repo_root, encrypted_vault_password_file, console)
+            elif stage["id"] == "collections":
+                run_shell_command([f"{context['repo_root']}/scripts/install-collections.sh"], repo_root, console)
+            elif stage["id"] in {"preflight", "bootstrap", "site", "backup"}:
+                run_shell_command(deploy_stage_command(stage["id"], context), repo_root, console)
+            elif stage["id"] == "ssh-lockdown":
+                lockdown_choice = ask_question(
+                    questionary.select(
+                        "Which SSH lockdown path do you want to run?",
+                        choices=[
+                            "Validation-only checks",
+                            "Restrictive SSH lockdown (--confirm)",
+                            "Return to the stage menu",
+                        ],
+                        default="Validation-only checks",
+                    ),
+                    context,
+                    console,
+                )
+                console.print()
+                if lockdown_choice == "Return to the stage menu":
+                    continue
+                run_shell_command(
+                    lockdown_stage_command(context, confirm=lockdown_choice == "Restrictive SSH lockdown (--confirm)"),
+                    repo_root,
+                    console,
+                )
+        except (subprocess.CalledProcessError, WizardError) as exc:
+            if isinstance(exc, subprocess.CalledProcessError):
+                console.print(f"[red]Stage failed with exit code {exc.returncode}.[/red]")
+            else:
+                console.print(f"[red]{exc}[/red]")
+            next_step = handle_runtime_stage_failure(context, console, stage["title"])
+            if next_step == "review":
+                return "review"
+            if next_step == "skip_remaining":
+                context["wizard_runtime_stage_index"] = len(stages)
+                persist_progress(context, len(profile.sections))
+                return "complete"
+            continue
+
+        stage_index += 1
+        context["wizard_runtime_stage_index"] = stage_index
+        persist_progress(context, len(profile.sections))
+
+    return "complete"
 
 
 def maybe_prompt_option(
@@ -2089,6 +2445,8 @@ def run_wizard(
         provided_answers = loaded_answers
     if vault_password_file is not None:
         provided_answers["vault_password_file"] = str(vault_password_file)
+        context["vault_password_file"] = str(vault_password_file)
+        context["vault_password_prompt_mode"] = "file"
     if "wizard_last_interrupt_at" not in context:
         context["wizard_last_interrupt_at"] = 0.0
     if "wizard_resume_section_index" not in context:
@@ -2118,7 +2476,9 @@ def run_wizard(
     answered_collections: set[str] = set()
 
     render_welcome(console, profile, assume_yes)
-    if profile.startup_fields:
+    resume_section_index = int(context.get("wizard_resume_section_index", 0))
+    skip_startup = is_resume_state and resume_section_index >= len(profile.sections)
+    if profile.startup_fields and not skip_startup:
         render_startup_intro(console)
         startup_section = SectionModel(id="startup", title="Startup", fields=profile.startup_fields)
         collect_fields(startup_section, context, provided_answers, assume_yes, console, repo_root, answered_fields)
@@ -2127,239 +2487,191 @@ def run_wizard(
     section_index = int(context.get("wizard_resume_section_index", 0))
     if is_resume_state and not assume_yes and furthest_resume_index(context) <= len(profile.sections):
         section_index = choose_resume_section(profile, context, furthest_resume_index(context), console)
-    while section_index < len(profile.sections):
-        context["wizard_current_section_index"] = section_index
-        context["wizard_resume_section_index"] = section_index
-        section = profile.sections[section_index]
-        if not evaluate_condition(section.when, context):
-            section_index += 1
-            continue
+    while True:
+        resumed_directly_to_stages = bool(context.get("wizard_outputs_written")) and section_index >= len(profile.sections)
+        sections_revisited = False
+        while section_index < len(profile.sections):
+            sections_revisited = True
+            context["wizard_current_section_index"] = section_index
+            context["wizard_resume_section_index"] = section_index
+            section = profile.sections[section_index]
+            if not evaluate_condition(section.when, context):
+                section_index += 1
+                continue
 
-        step_index = sum(1 for item in profile.sections[: section_index + 1] if evaluate_condition(item.when, context))
-        render_section_intro(console, section, step_index)
-        if section.kind == "fields":
-            collect_fields(section, context, provided_answers, assume_yes, console, repo_root, answered_fields)
-        else:
-            collect_repeatable(
-                section,
-                context,
-                provided_answers,
-                assume_yes,
-                console,
-                repo_root,
-                answered_collections,
+            step_index = sum(1 for item in profile.sections[: section_index + 1] if evaluate_condition(item.when, context))
+            render_section_intro(console, section, step_index)
+            if section.kind == "fields":
+                collect_fields(section, context, provided_answers, assume_yes, console, repo_root, answered_fields)
+            else:
+                collect_repeatable(
+                    section,
+                    context,
+                    provided_answers,
+                    assume_yes,
+                    console,
+                    repo_root,
+                    answered_collections,
+                )
+            run_section_actions(section, context, repo_root, assume_yes, console)
+
+            context["wizard_outputs_written"] = False
+            context["wizard_runtime_stage_index"] = 0
+            persist_progress(context, section_index + 1)
+
+            if assume_yes:
+                section_index += 1
+                continue
+
+            nav_choices = next_navigation_choices(profile, context, section_index)
+            console.print(
+                "Continue moves forward from here. Review reopens an earlier step with your current answers prefilled.",
+                style="dim",
             )
-        run_section_actions(section, context, repo_root, assume_yes, console)
+            console.print()
+            navigation = ask_question(
+                questionary.select(
+                    "What do you want to do next?",
+                    choices=nav_choices,
+                    default=nav_choices[0],
+                ),
+                context,
+                console,
+            )
+            console.print()
+            if navigation == "Review a step":
+                resume_index = furthest_resume_index(context)
+                previous_index = choose_completed_section(profile, context, resume_index - 1, resume_index, console)
+                if previous_index is not None:
+                    section_index = previous_index
+                    continue
+            if navigation == "Save progress and exit":
+                save_and_exit(context, console)
+            if navigation == "Exit without saving progress":
+                exit_without_saving(context, console)
+            if navigation.startswith("Resume at "):
+                section_index = furthest_resume_index(context)
+                continue
+            section_index += 1
 
-        persist_progress(context, section_index + 1)
+        outputs_already_written = resumed_directly_to_stages and not sections_revisited
+        log_path = None
+        if outputs_already_written:
+            write_details = bool(context.get("write_details", False))
+            include_secret_details = bool(context.get("include_secret_details", False))
+            write_log = bool(context.get("write_log", False))
+        else:
+            explain_next_choice(
+                console,
+                "Optional record file",
+                "A private details file can capture setup notes and, if you choose, raw secrets for handoff or safekeeping.",
+            )
+            write_details = maybe_prompt_runtime_option(
+                provided_answers,
+                "write_details",
+                "Write sensitive details file?",
+                False,
+                assume_yes,
+                context,
+                console,
+            )
+            include_secret_details = False
+            if write_details:
+                explain_next_choice(
+                    console,
+                    "Raw secrets in the record file",
+                    "Including raw secrets makes handoff easier, but it also creates another sensitive file to protect or delete afterward.",
+                )
+                include_secret_details = maybe_prompt_runtime_option(
+                    provided_answers,
+                    "include_secret_details",
+                    "Include raw secret values in the details file?",
+                    False,
+                    assume_yes,
+                    context,
+                    console,
+                )
+            explain_next_choice(
+                console,
+                "Optional audit log",
+                "The audit log records what the wizard did without storing raw secrets. It is useful for traceability and reruns.",
+            )
+            write_log = maybe_prompt_runtime_option(
+                provided_answers,
+                "write_log",
+                "Write sanitized audit log?",
+                False,
+                assume_yes,
+                context,
+                console,
+            )
+            context["write_details"] = write_details
+            context["include_secret_details"] = include_secret_details
+            context["write_log"] = write_log
+
+        built = builder(context)
+        built["profile_id"] = context["profile_id"]
+        built["timestamp"] = context["timestamp"]
+        built["write_details"] = write_details
+        built["include_secret_details"] = include_secret_details
+
+        vault_was_encrypted = is_ansible_vault_file(inventory_vault_path(repo_root))
+        context["wizard_existing_vault_was_encrypted"] = vault_was_encrypted
+        rendered_outputs = render_outputs(profile, built, template_root)
+
+        if not outputs_already_written:
+            render_review_summary(console, built, rendered_outputs, repo_root)
+            for output, content in rendered_outputs:
+                if output.id == "vault" and vault_was_encrypted:
+                    continue
+                write_output_file(repo_root, built, output, content, console)
+            if vault_was_encrypted and any(output.id == "vault" for output, _ in rendered_outputs):
+                console.print(
+                    "[yellow]Kept the existing encrypted vault.yml in place for now. The runtime vault stage will let you replace it with the regenerated values or keep the existing encrypted file.[/yellow]"
+                )
+
+            if write_log:
+                log_path = write_audit_log(repo_root, built)
+                console.print(f"[green]Wrote[/green] {display_path(log_path, repo_root)}")
+
+            context["wizard_outputs_written"] = True
+            context["wizard_resume_section_index"] = len(profile.sections)
+            context["wizard_runtime_stage_index"] = 0
+            persist_progress(context, len(profile.sections))
 
         if assume_yes:
-            section_index += 1
-            continue
+            cleanup_generated_resume_state(selected_answers_path, built, console)
+            console.print(
+                Panel(
+                    "[bold green]Setup files written.[/bold green]\n"
+                    "[dim]Resume with interactive stages later if you want the wizard to run deployment steps.[/dim]",
+                    border_style="green",
+                    box=box.ROUNDED,
+                    padding=(1, 2),
+                )
+            )
+            if write_details:
+                console.print("[yellow]Sensitive details file written. Store it carefully or delete it after handoff.[/yellow]")
+            if log_path:
+                console.print("[cyan]Sanitized audit log written.[/cyan]")
+            return
 
-        nav_choices = next_navigation_choices(profile, context, section_index)
-        console.print(
-            "Continue moves to the next step from here. Resume jumps back to the furthest point you had already reached.",
-            style="dim",
-        )
-        console.print()
-        navigation = ask_question(
-            questionary.select(
-                "What do you want to do next?",
-                choices=nav_choices,
-                default=nav_choices[0],
-            ),
-            context,
-            console,
-        )
-        console.print()
-        if navigation == "Review a step":
+        runtime_result = run_runtime_stages(profile, context, built, rendered_outputs, repo_root, console)
+        if runtime_result == "review":
             resume_index = furthest_resume_index(context)
-            previous_index = choose_completed_section(profile, context, resume_index - 1, resume_index, console)
-            if previous_index is not None:
-                section_index = previous_index
-                continue
-        if navigation.startswith("Resume at "):
-            section_index = furthest_resume_index(context)
+            previous_index = choose_completed_section(profile, context, len(profile.sections) - 1, resume_index, console)
+            context["wizard_outputs_written"] = False
+            context["wizard_runtime_stage_index"] = 0
+            section_index = previous_index if previous_index is not None else 0
             continue
-        section_index += 1
-
-    explain_next_choice(
-        console,
-        "Optional record file",
-        "A private details file can capture setup notes and, if you choose, raw secrets for handoff or safekeeping.",
-    )
-    write_details = maybe_prompt_runtime_option(
-        provided_answers,
-        "write_details",
-        "Write sensitive details file?",
-        False,
-        assume_yes,
-        context,
-        console,
-    )
-    include_secret_details = False
-    if write_details:
-        explain_next_choice(
-            console,
-            "Raw secrets in the record file",
-            "Including raw secrets makes handoff easier, but it also creates another sensitive file to protect or delete afterward.",
-        )
-        include_secret_details = maybe_prompt_runtime_option(
-            provided_answers,
-            "include_secret_details",
-            "Include raw secret values in the details file?",
-            False,
-            assume_yes,
-            context,
-            console,
-        )
-    explain_next_choice(
-        console,
-        "Optional audit log",
-        "The audit log records what the wizard did without storing raw secrets. It is useful for traceability and reruns.",
-    )
-    write_log = maybe_prompt_runtime_option(
-        provided_answers,
-        "write_log",
-        "Write sanitized audit log?",
-        False,
-        assume_yes,
-        context,
-        console,
-    )
-
-    context["write_details"] = write_details
-    context["include_secret_details"] = include_secret_details
-
-    built = builder(context)
-    built["profile_id"] = context["profile_id"]
-    built["timestamp"] = context["timestamp"]
-    built["write_details"] = write_details
-    built["include_secret_details"] = include_secret_details
-
-    vault_was_encrypted = is_ansible_vault_file(inventory_vault_path(repo_root))
-    rendered_outputs = render_outputs(profile, built, template_root)
-    render_review_summary(console, built, rendered_outputs, repo_root)
-    for output, _ in rendered_outputs:
-        backup_existing(repo_root / render_template_string(output.path, built))
-
-    for output, content in rendered_outputs:
-        target_path = repo_root / render_template_string(output.path, built)
-        atomic_write(target_path, content.rstrip() + "\n", int(output.mode, 8))
-        console.print(f"[green]Wrote[/green] {display_path(target_path, repo_root)}")
-
-    run_post_write_actions(profile, built, repo_root, assume_yes, console)
-
-    log_path = None
-    if write_log:
-        log_path = write_audit_log(repo_root, built)
-        console.print(f"[green]Wrote[/green] {display_path(log_path, repo_root)}")
-
-    explain_next_choice(
-        console,
-        "Vault encryption",
-        (
-            "The wizard has just regenerated vault.yml from the current answers. "
-            "Encrypting it now restores Ansible Vault protection before any real deployment steps begin."
-            if vault_was_encrypted
-            else "If you encrypt vault.yml now, the secret file is protected before any real deployment steps begin."
-        ),
-    )
-    encrypt_prompt = (
-        "Encrypt or re-encrypt inventories/prod/group_vars/vault.yml now?"
-        if vault_was_encrypted
-        else "Encrypt inventories/prod/group_vars/vault.yml now?"
-    )
-    encrypt_vault = encrypt_override if encrypt_override is not None else maybe_prompt_runtime_option(
-        provided_answers,
-        "encrypt_vault",
-        encrypt_prompt,
-        True,
-        assume_yes,
-        context,
-        console,
-    )
-    explain_next_choice(
-        console,
-        "Preflight validation",
-        "Preflight checks the generated inventory for missing values, risky combinations, and obvious deployment blockers before you touch the host.",
-    )
-    run_preflight_now = preflight_override if preflight_override is not None else maybe_prompt_runtime_option(
-        provided_answers,
-        "run_preflight",
-        "Run preflight now?",
-        False,
-        assume_yes,
-        context,
-        console,
-    )
-    configured_password_path = configured_vault_password_file_path(repo_root)
-    existing_password_file = finalize_vault_password_file(
-        repo_root,
-        context.get("vault_password_file", provided_answers.get("vault_password_file")),
-        False,
-        context,
-        console,
-        needs_prompt=False,
-        requires_noninteractive_value=False,
-    )
-    if (
-        configured_password_path is not None
-        and existing_password_file is None
-        and (encrypt_vault or run_preflight_now)
-    ):
-        explain_next_choice(
-            console,
-            "Vault password file",
-            "A managed vault password file lets deploy and preflight reuse the same local secret without extra prompts. "
-            "The file is stored at the repo's configured default path with 0600 permissions.",
-        )
-        create_vault_password_file = maybe_prompt_runtime_option(
-            provided_answers,
-            "create_vault_password_file",
-            f"Create the default vault password file at {display_path(configured_password_path, repo_root)}?",
-            True,
-            assume_yes,
-            context,
-            console,
-        )
-        if create_vault_password_file:
-            managed_password_file = ensure_vault_password_file(configured_password_path, console)
-            context["vault_password_file"] = str(managed_password_file)
-    if encrypt_vault:
-        encrypted_vault_password_file = finalize_vault_password_file(
-            repo_root,
-            context.get("vault_password_file", provided_answers.get("vault_password_file")),
-            assume_yes,
-            context,
-            console,
-            needs_prompt=True,
-            requires_noninteractive_value=False,
-        )
-        if encrypted_vault_password_file is not None:
-            context["vault_password_file"] = str(encrypted_vault_password_file)
-        encrypt_vault_file(repo_root, encrypted_vault_password_file, console)
-    if run_preflight_now:
-        preflight_password_file = finalize_vault_password_file(
-            repo_root,
-            context.get("vault_password_file", provided_answers.get("vault_password_file")),
-            assume_yes,
-            context,
-            console,
-            needs_prompt=is_ansible_vault_file(inventory_vault_path(repo_root)),
-            requires_noninteractive_value=is_ansible_vault_file(inventory_vault_path(repo_root)),
-        )
-        if preflight_password_file is not None:
-            context["vault_password_file"] = str(preflight_password_file)
-        run_preflight(repo_root, console, preflight_password_file)
+        break
 
     cleanup_generated_resume_state(selected_answers_path, built, console)
 
     console.print(
         Panel(
-            "[bold green]Configuration complete.[/bold green]\n"
-            "[dim]Your files are written and the next deployment steps are ready when you are.[/dim]",
+            "[bold green]Setup complete.[/bold green]\n"
+            "[dim]Configuration, vault handling, and the selected execution stages are finished.[/dim]",
             border_style="green",
             box=box.ROUNDED,
             padding=(1, 2),
@@ -2367,5 +2679,5 @@ def run_wizard(
     )
     if write_details:
         console.print("[yellow]Sensitive details file written. Store it carefully or delete it after handoff.[/yellow]")
-    if log_path:
+    if context.get("write_log"):
         console.print("[cyan]Sanitized audit log written.[/cyan]")
