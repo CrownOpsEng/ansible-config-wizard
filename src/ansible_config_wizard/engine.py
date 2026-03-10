@@ -684,9 +684,12 @@ def choose_completed_section(
     console: Console,
 ) -> int | None:
     completed = completed_visible_sections(profile.sections, context, current_index)
-    resume_label = describe_next_step(profile, context, resume_index - 1)
-    labels = [resume_label]
-    label_to_index = {resume_label: resume_index}
+    labels: list[str] = []
+    label_to_index: dict[str, int] = {}
+    if resume_index <= len(profile.sections):
+        resume_label = f"Resume at {describe_step_target(profile, context, resume_index - 1)}"
+        labels.append(resume_label)
+        label_to_index[resume_label] = resume_index
     for index, step_number, section in completed:
         label = f"Review Step {step_number}: {section.title}"
         labels.append(label)
@@ -697,9 +700,9 @@ def choose_completed_section(
     console.print()
     choice = ask_question(
         questionary.select(
-            "Choose a step to review, or resume from the furthest completed point.",
+            "Pick a step to revisit, or jump back to your furthest saved point.",
             choices=labels,
-            default=resume_label,
+            default=labels[0],
         ),
         context,
         console,
@@ -719,6 +722,13 @@ def describe_next_step(profile: ProfileModel, context: dict[str, Any], current_i
     return "Continue to final output options"
 
 
+def describe_step_target(profile: ProfileModel, context: dict[str, Any], current_index: int) -> str:
+    label = describe_next_step(profile, context, current_index)
+    if label.startswith("Continue to "):
+        return label.removeprefix("Continue to ")
+    return "final output options"
+
+
 def choose_resume_section(
     profile: ProfileModel,
     context: dict[str, Any],
@@ -729,7 +739,7 @@ def choose_resume_section(
     choices: list[str] = []
     label_to_index: dict[str, int] = {}
 
-    continue_label = describe_next_step(profile, context, resume_index - 1)
+    continue_label = f"Resume at {describe_step_target(profile, context, resume_index - 1)}"
     choices.append(continue_label)
     label_to_index[continue_label] = resume_index
 
@@ -741,7 +751,7 @@ def choose_resume_section(
     console.print()
     console.print("[bold]Resume point[/bold]", style="cyan")
     console.print(
-        "You can continue where the last run left off or reopen any completed step with your existing answers prefilled.",
+        "Continue from your furthest saved point, or reopen any finished step with your current answers prefilled.",
         style="dim",
     )
     console.print()
@@ -756,6 +766,21 @@ def choose_resume_section(
     )
     console.print()
     return label_to_index[selection]
+
+
+def next_navigation_choices(profile: ProfileModel, context: dict[str, Any], current_index: int) -> list[str]:
+    choices: list[str] = []
+    direct_next = describe_next_step(profile, context, current_index)
+    choices.append(direct_next)
+
+    resume_index = furthest_resume_index(context)
+    resume_label = f"Resume at {describe_step_target(profile, context, resume_index - 1)}"
+    if resume_index != current_index + 1 and resume_label != direct_next:
+        choices.append(resume_label)
+
+    if completed_visible_sections(profile.sections, context, resume_index - 1):
+        choices.append("Review a step")
+    return choices
 
 
 def write_action_commands(section: SectionModel, commands: str, context: dict[str, Any]) -> Path:
@@ -993,7 +1018,13 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
     while True:
         message = render_template_string(action.message_template, context)
         console.print(Rule(f"[bold cyan]{section.title}[/bold cyan]"))
-        console.print(message, soft_wrap=True, highlight=False)
+        console.print(message.strip(), soft_wrap=True, highlight=False)
+        console.print()
+        console.print(
+            "Recommended: let the wizard install the key now. Manual commands stay available if you want them.",
+            style="dim",
+        )
+        console.print()
         if manual_requested:
             render_manual_action_commands(section, commands, context, console)
 
@@ -1441,10 +1472,11 @@ def run_wizard(
             section_index += 1
             continue
 
-        resume_index = furthest_resume_index(context)
-        nav_choices = [describe_next_step(profile, context, resume_index - 1)]
-        if completed_visible_sections(profile.sections, context, resume_index - 1):
-            nav_choices.append("Review a completed step")
+        nav_choices = next_navigation_choices(profile, context, section_index)
+        console.print(
+            "Continue moves to the next step from here. Resume jumps back to the furthest point you had already reached.",
+            style="dim",
+        )
         console.print()
         navigation = ask_question(
             questionary.select(
@@ -1456,12 +1488,16 @@ def run_wizard(
             console,
         )
         console.print()
-        if navigation == "Review a completed step":
+        if navigation == "Review a step":
+            resume_index = furthest_resume_index(context)
             previous_index = choose_completed_section(profile, context, resume_index - 1, resume_index, console)
             if previous_index is not None:
                 section_index = previous_index
                 continue
-        section_index = resume_index
+        if navigation.startswith("Resume at "):
+            section_index = furthest_resume_index(context)
+            continue
+        section_index += 1
 
     explain_next_choice(
         console,

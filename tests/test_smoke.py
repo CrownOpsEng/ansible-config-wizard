@@ -17,9 +17,11 @@ from ansible_config_wizard.engine import (
     build_ssh_setup_commands,
     completed_visible_sections,
     describe_next_step,
+    describe_step_target,
     evaluate_condition,
     furthest_resume_index,
     latest_resume_state_path,
+    next_navigation_choices,
     persist_progress,
     previous_visible_section_index,
     resolve_field,
@@ -223,6 +225,7 @@ def test_describe_next_step_uses_following_visible_section() -> None:
     assert describe_next_step(profile, {"enabled": False}, 0) == "Continue to Step 2: Three"
     assert describe_next_step(profile, {"enabled": True}, 1) == "Continue to Step 3: Three"
     assert describe_next_step(profile, {"enabled": False}, -1) == "Continue to Step 1: One"
+    assert describe_step_target(profile, {"enabled": False}, 0) == "Step 2: Three"
 
 
 def test_persist_progress_preserves_furthest_resume_index(tmp_path: Path) -> None:
@@ -240,6 +243,26 @@ def test_persist_progress_preserves_furthest_resume_index(tmp_path: Path) -> Non
     saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
     assert saved["wizard_resume_section_index"] == 2
     assert saved["wizard_furthest_resume_index"] == 4
+
+
+def test_next_navigation_choices_prioritize_local_continue() -> None:
+    sections = [
+        SectionModel(id="one", title="One"),
+        SectionModel(id="two", title="Two"),
+        SectionModel(id="three", title="Three"),
+        SectionModel(id="four", title="Four"),
+    ]
+    profile = type("Profile", (), {"sections": sections})()
+    context = {
+        "wizard_resume_section_index": 1,
+        "wizard_furthest_resume_index": 3,
+    }
+
+    assert next_navigation_choices(profile, context, 1) == [
+        "Continue to Step 3: Three",
+        "Resume at Step 4: Four",
+        "Review a step",
+    ]
 
 
 def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -> None:
