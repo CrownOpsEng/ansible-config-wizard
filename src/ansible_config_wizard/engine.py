@@ -15,8 +15,10 @@ import pexpect
 import questionary
 import yaml
 from jinja2 import Environment, FileSystemLoader
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 
 from .generators import generate_value, load_ed25519_keypair
 from .models import ActionModel, FieldModel, OutputModel, ProfileModel, SectionModel
@@ -186,7 +188,8 @@ def prompt_key_value(field: FieldModel, default: dict[str, str] | None, console:
             return default
 
     result: dict[str, str] = {}
-    console.print(f"[bold]{field.label}[/bold] (leave key blank to finish)")
+    console.print(f"[bold]{field.label}[/bold]", style="cyan")
+    console.print("Leave the key blank when you are finished.", style="dim")
     while True:
         key = questionary.text("Key").ask()
         if not key:
@@ -199,7 +202,7 @@ def prompt_key_value(field: FieldModel, default: dict[str, str] | None, console:
 def prompt_field(field: FieldModel, default: Any, console: Console) -> Any:
     prompt = field.label
     if field.help:
-        prompt = f"{prompt} ({field.help})"
+        console.print(field.help, style="dim")
 
     if field.type == "confirm":
         return questionary.confirm(prompt, default=bool(default)).ask()
@@ -526,6 +529,32 @@ def verify_ssh_key_access(host: str, ssh_user: str, private_key_path: str) -> No
         raise WizardError(f"Managed SSH key installed, but verification failed: {stderr}")
 
 
+def render_manual_action_commands(
+    section: SectionModel,
+    commands: str,
+    context: dict[str, Any],
+    console: Console,
+) -> None:
+    command_path = write_action_commands(section, commands, context)
+    console.print()
+    console.print("[cyan]Manual commands file[/cyan]")
+    console.print(str(command_path), soft_wrap=True, highlight=False)
+    console.print()
+    console.print("[cyan]Manual commands[/cyan]")
+    console.print(commands, soft_wrap=True, highlight=False)
+    console.print()
+
+
+def pause_wizard(action: ActionModel, context: dict[str, Any], console: Console) -> None:
+    resume_state_path = ""
+    if action.save_state:
+        resume_state_path = str(write_resume_state(context))
+        context["resume_state_path"] = resume_state_path
+    if resume_state_path:
+        console.print(f"[yellow]Resume later with:[/yellow] [bold]--answers-file {resume_state_path}[/bold]")
+    raise WizardPaused("Wizard paused by operator.")
+
+
 def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: dict[str, Any], console: Console) -> None:
     host = render_template_string(action.host_template, context)
     ssh_user = render_template_string(action.ssh_user_template, context)
@@ -537,46 +566,57 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
         if action.commands_template
         else build_ssh_setup_commands(host, ssh_user, public_key_path, private_key_path, resume_command)
     )
+    manual_requested = False
 
     while True:
         message = render_template_string(action.message_template, context)
-        console.print(f"[yellow][bold]{section.title}[/bold][/yellow]")
+        console.print(Rule(f"[bold cyan]{section.title}[/bold cyan]"))
         console.print(message, soft_wrap=True, highlight=False)
-        command_path = write_action_commands(section, commands, context)
-        console.print()
-        console.print("[cyan]Commands file:[/cyan]")
-        console.print(str(command_path), soft_wrap=True, highlight=False)
-        console.print()
-        console.print("[cyan]Commands:[/cyan]")
-        console.print(commands, soft_wrap=True, highlight=False)
-        console.print()
+        if manual_requested:
+            render_manual_action_commands(section, commands, context, console)
 
         choice = questionary.select(
             action.prompt,
             choices=[
-                "Install key now with password",
-                "Exit and resume later",
-                "Continue now",
+                "Install now (recommended)",
+                "Show manual steps",
+                "I already finished this, continue",
+                "Pause here and resume later",
             ],
-            default="Install key now with password",
+            default="Install now (recommended)",
         ).ask()
-        if choice == "Install key now with password":
+        if choice == "Install now (recommended)":
             password = questionary.password(f"Password for {ssh_user}@{host}").ask()
             if not password:
                 console.print("[yellow]No password entered.[/yellow]")
                 continue
-            install_ssh_key_with_password(host, ssh_user, public_key_path, password, console)
-            verify_ssh_key_access(host, ssh_user, private_key_path)
+            try:
+                install_ssh_key_with_password(host, ssh_user, public_key_path, password, console)
+                verify_ssh_key_access(host, ssh_user, private_key_path)
+            except WizardError as exc:
+                console.print(f"[red]{exc}[/red]")
+                manual_requested = True
+                follow_up = questionary.select(
+                    "The automatic path hit a snag. What do you want to do next?",
+                    choices=[
+                        "Show manual steps",
+                        "Try automatic install again",
+                        "Pause here and resume later",
+                    ],
+                    default="Show manual steps",
+                ).ask()
+                if follow_up == "Try automatic install again":
+                    continue
+                if follow_up == "Pause here and resume later":
+                    pause_wizard(action, context, console)
+                continue
             console.print("[green]Managed SSH key installed and verified.[/green]")
             return
-        if choice == "Exit and resume later":
-            resume_state_path = ""
-            if action.save_state:
-                resume_state_path = str(write_resume_state(context))
-                context["resume_state_path"] = resume_state_path
-            if resume_state_path:
-                console.print(f"[yellow]Resume later with:[/yellow] [bold]--answers-file {resume_state_path}[/bold]")
-            raise WizardPaused("Wizard paused by operator.")
+        if choice == "Show manual steps":
+            manual_requested = True
+            continue
+        if choice == "Pause here and resume later":
+            pause_wizard(action, context, console)
         return
 
 
@@ -599,19 +639,12 @@ def run_section_actions(
             continue
 
         message = render_template_string(action.message_template, context)
-        console.print(f"[yellow][bold]{section.title}[/bold][/yellow]")
+        console.print(Rule(f"[bold cyan]{section.title}[/bold cyan]"))
         console.print(message, soft_wrap=True, highlight=False)
 
         if action.commands_template:
             commands = render_template_string(action.commands_template, context).strip()
-            command_path = write_action_commands(section, commands, context)
-            console.print()
-            console.print("[cyan]Commands file:[/cyan]")
-            console.print(str(command_path), soft_wrap=True, highlight=False)
-            console.print()
-            console.print("[cyan]Commands:[/cyan]")
-            console.print(commands, soft_wrap=True, highlight=False)
-            console.print()
+            render_manual_action_commands(section, commands, context, console)
 
         choice = questionary.select(
             action.prompt,
@@ -619,15 +652,38 @@ def run_section_actions(
             default="Continue now",
         ).ask()
         if choice == "Exit and resume later":
-            resume_state_path = ""
-            if action.save_state:
-                resume_state_path = str(write_resume_state(context))
-                context["resume_state_path"] = resume_state_path
-            if resume_state_path:
-                console.print(
-                    f"[yellow]Resume later with:[/yellow] [bold]--answers-file {resume_state_path}[/bold]"
-                )
-            raise WizardPaused("Wizard paused by operator.")
+            pause_wizard(action, context, console)
+
+
+def render_welcome(console: Console, profile: ProfileModel, assume_yes: bool) -> None:
+    mode_label = "guided" if not assume_yes else "non-interactive"
+    console.print(
+        Panel(
+            f"[bold green]{profile.name}[/bold green]\n"
+            f"[dim]Profile: {profile.id}[/dim]\n\n"
+            "A calm setup pass with secure defaults, clear branches, and a clean handoff at the end.\n"
+            f"[dim]Mode: {mode_label}[/dim]",
+            border_style="green",
+            box=box.ROUNDED,
+            padding=(1, 2),
+        )
+    )
+
+
+def render_section_intro(console: Console, section: SectionModel, index: int) -> None:
+    body = ""
+    if section.description:
+        body = f"{section.description}\n\n"
+    body += f"[dim]Step {index}[/dim]"
+    console.print(
+        Panel(
+            body,
+            title=f"[bold blue]{section.title}[/bold blue]",
+            border_style="blue",
+            box=box.ROUNDED,
+            padding=(0, 2),
+        )
+    )
 
 
 def yaml_value(value: Any) -> str:
@@ -786,14 +842,14 @@ def run_wizard(
     )
     context["wizard_resume_state_path"] = str(Path(context["wizard_run_dir"]) / "config-wizard-state.yml")
 
-    console.print(Panel.fit(f"{profile.name}\nProfile: {profile.id}", border_style="green"))
+    render_welcome(console, profile, assume_yes)
 
+    step_index = 0
     for section in profile.sections:
         if not evaluate_condition(section.when, context):
             continue
-        console.print(Panel.fit(section.title, border_style="blue"))
-        if section.description:
-            console.print(f"[dim]{section.description}[/dim]")
+        step_index += 1
+        render_section_intro(console, section, step_index)
         if section.kind == "fields":
             collect_fields(section, context, provided_answers, assume_yes, console, repo_root)
         else:
@@ -858,7 +914,15 @@ def run_wizard(
 
     cleanup_generated_resume_state(answers_path, built, console)
 
-    console.print(Panel.fit("Configuration wizard complete.", border_style="green"))
+    console.print(
+        Panel(
+            "[bold green]Configuration complete.[/bold green]\n"
+            "[dim]Your files are written and the next deployment steps are ready when you are.[/dim]",
+            border_style="green",
+            box=box.ROUNDED,
+            padding=(1, 2),
+        )
+    )
     if write_details:
         console.print("[yellow]Sensitive details file written. Store it carefully or delete it after handoff.[/yellow]")
     if log_path:
