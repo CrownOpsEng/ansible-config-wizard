@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from ansible_config_wizard.engine import (
     local_command_menu_labels,
     persist_progress,
     prompt_for_vault_authentication,
+    prompt_for_known_hosts_value,
     reset_following_stage_state,
     resolve_field,
     resolve_local_command_options,
@@ -38,6 +40,7 @@ from ansible_config_wizard.engine import (
     stage_label,
     stage_menu_choices,
     stage_state,
+    trusted_local_known_hosts_entries,
     visible_stages,
 )
 from ansible_config_wizard.models import (
@@ -187,6 +190,39 @@ def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
     assert public_key.endswith("deploy@demo-01")
     assert public_key.count("deploy@demo-01") == 1
     assert not any(path.name == "config-wizard-state.yml" for path in state_root.glob("sample/repo/runs/*/config-wizard-state.yml"))
+
+
+def test_trusted_local_known_hosts_entries_filters_ssh_keygen_comments(monkeypatch) -> None:
+    expected = "|1|abc|def ssh-ed25519 AAAATEST trusted@example"
+
+    def fake_run(command, check, capture_output, text):
+        assert command == ["ssh-keygen", "-F", "[backup.example.com]:2222"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="# Host [backup.example.com]:2222 found: line 1\n|1|abc|def ssh-ed25519 AAAATEST trusted@example\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("ansible_config_wizard.engine.subprocess.run", fake_run)
+
+    assert trusted_local_known_hosts_entries("backup.example.com", 2222) == [expected]
+
+
+def test_prompt_for_known_hosts_value_can_reuse_local_trust(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ansible_config_wizard.engine.trusted_local_known_hosts_entries",
+        lambda host, port: ["|1|abc|def ssh-ed25519 AAAATEST trusted@example"],
+    )
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda *args, **kwargs: "Use keys already trusted in ~/.ssh/known_hosts")
+
+    buffer = Buffer()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+    field = FieldModel(id="ssh_known_hosts", label="Pinned SSH host keys", type="multiline_text")
+
+    value = prompt_for_known_hosts_value(field, {}, console, "backup.example.com", 22, None, None)
+
+    assert value == "|1|abc|def ssh-ed25519 AAAATEST trusted@example"
 
 
 def test_visible_stages_respect_phase_and_stage_conditions() -> None:

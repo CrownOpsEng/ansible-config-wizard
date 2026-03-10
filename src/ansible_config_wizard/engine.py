@@ -549,6 +549,25 @@ def trusted_known_hosts_value(
     return str(value or "").strip()
 
 
+def trusted_local_known_hosts_entries(host: str, port: int | str, known_hosts_path: Path | None = None) -> list[str]:
+    lookup_name = ssh_host_lookup_name(host, port)
+    command = ["ssh-keygen", "-F", lookup_name]
+    if known_hosts_path is not None:
+        command.extend(["-f", str(known_hosts_path)])
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
 def prompt_for_known_hosts_value(
     field: FieldModel,
     context: dict[str, Any],
@@ -568,20 +587,29 @@ def prompt_for_known_hosts_value(
             f"The wizard can scan {scan_target} on your machine and let you choose which host keys to trust.",
             style="dim",
         )
+        local_entries = trusted_local_known_hosts_entries(host, port)
+        local_choice = "Use keys already trusted in ~/.ssh/known_hosts"
+        choices = [
+            *( [local_choice] if local_entries else [] ),
+            "Scan now",
+            "Paste manually",
+            "Leave blank for now",
+        ]
         choice = ask_question(
             questionary.select(
                 "How would you like to set the trusted host keys?",
-                choices=[
-                    "Scan now",
-                    "Paste manually",
-                    "Leave blank for now",
-                ],
-                default="Scan now",
+                choices=choices,
+                default=local_choice if local_entries else "Scan now",
             ),
             context,
             console,
         )
         console.print()
+        if choice == local_choice:
+            console.print("Using host keys already trusted locally:")
+            console.print("\n".join(local_entries), markup=False, highlight=False, no_wrap=True, overflow="ignore")
+            console.print()
+            return "\n".join(local_entries)
         if choice == "Paste manually":
             return trusted_known_hosts_value(field, display_default, prompt_default, console, context)
         if choice == "Leave blank for now":
@@ -663,14 +691,7 @@ def prompt_for_known_hosts_value(
 
 
 def is_host_key_trusted_locally(host: str, port: int | str) -> bool:
-    lookup_name = ssh_host_lookup_name(host, port)
-    result = subprocess.run(
-        ["ssh-keygen", "-F", lookup_name],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
+    return bool(trusted_local_known_hosts_entries(host, port))
 
 
 def add_known_hosts_entries(entries: list[str], known_hosts_path: Path) -> None:
