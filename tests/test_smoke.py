@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import shutil
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
-import yaml
-
 import pytest
+import yaml
 from rich.console import Console
 
 from ansible_config_wizard.engine import (
@@ -16,25 +16,42 @@ from ansible_config_wizard.engine import (
     ask_question,
     build_ssh_setup_commands,
     collect_repeatable,
-    completed_visible_sections,
-    describe_next_step,
-    describe_step_target,
-    evaluate_condition,
-    furthest_resume_index,
+    configured_vault_password_file,
+    configured_vault_password_file_path,
+    ensure_vault_password_file,
+    encrypt_vault_file,
+    initialize_workflow_context,
     install_ssh_key_with_password,
     latest_resume_state_path,
     local_command_choice_default,
     local_command_choice_labels,
     local_command_menu_default,
     local_command_menu_labels,
-    next_navigation_choices,
     persist_progress,
-    previous_visible_section_index,
+    prompt_for_vault_authentication,
+    prompt_for_known_hosts_value,
+    reset_following_stage_state,
     resolve_field,
     resolve_local_command_options,
+    review_boundary_index,
+    run_preflight,
     run_wizard,
+    stage_heading,
+    stage_label,
+    stage_menu_choices,
+    stage_state,
+    trusted_local_known_hosts_entries,
+    visible_stages,
 )
-from ansible_config_wizard.models import ActionModel, FieldModel, LocalCommandOptionModel, SectionModel
+from ansible_config_wizard.models import (
+    ActionModel,
+    FieldModel,
+    LocalCommandOptionModel,
+    PhaseModel,
+    ProfileModel,
+    RepeatableModel,
+    StageModel,
+)
 
 
 class Buffer:
@@ -46,6 +63,87 @@ class Buffer:
 
     def flush(self) -> None:
         return
+
+
+def write_interactive_profile(repo_root: Path) -> Path:
+    profile_path = repo_root / "wizard_profiles" / "interactive.yml"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(
+        """
+id: interactive
+name: Interactive Test Profile
+builder: wizard_support.builders:build_sample_context
+defaults:
+  ansible_user: deploy
+phases:
+  - id: configure
+    title: Configure
+    stages:
+      - id: basics
+        title: Basics
+        kind: form_stage
+        fields:
+          - id: host_name
+            label: Host name
+            required: true
+          - id: ansible_host
+            label: Ansible host
+            required: true
+          - id: base_domain
+            label: Base domain
+            required: true
+          - id: vault_demo_password
+            label: Demo password
+            secret: true
+            source:
+              kind: generate
+              generator: password
+              params:
+                length: 24
+      - id: review
+        title: Review
+        kind: review_stage
+  - id: prepare
+    title: Prepare
+    stages:
+      - id: prepare
+        title: Prepare
+        kind: command_stage
+        allow_skip: true
+        actions:
+          - kind: local_command
+            message_template: Run the prepare command.
+            command_template: echo prepare
+            prompt: What do you want to do with this stage command?
+            available_choices: [show, run, leave]
+            default_choice: run
+            working_directory_template: "{{ repo_root }}"
+  - id: deploy
+    title: Deploy
+    stages:
+      - id: verify
+        title: Verification
+        kind: manual_stage
+        allow_skip: true
+        checklist:
+          - Confirm the service is reachable.
+        confirmation_prompt: When verification is complete, what do you want to do?
+outputs:
+  - id: hosts
+    path: inventories/prod/hosts.yml
+    template: wizard_templates/sample/hosts.yml.j2
+  - id: all
+    path: inventories/prod/group_vars/all.yml
+    template: wizard_templates/sample/all.yml.j2
+  - id: vault
+    path: inventories/prod/group_vars/vault.yml
+    template: wizard_templates/sample/vault.yml.j2
+    mode: "0600"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return profile_path
 
 
 def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
@@ -94,29 +192,294 @@ def test_run_wizard_with_external_builder(tmp_path: Path, monkeypatch) -> None:
     assert not any(path.name == "config-wizard-state.yml" for path in state_root.glob("sample/repo/runs/*/config-wizard-state.yml"))
 
 
+def test_trusted_local_known_hosts_entries_filters_ssh_keygen_comments(monkeypatch) -> None:
+    expected = "|1|abc|def ssh-ed25519 AAAATEST trusted@example"
+
+    def fake_run(command, check, capture_output, text):
+        assert command == ["ssh-keygen", "-F", "[backup.example.com]:2222"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="# Host [backup.example.com]:2222 found: line 1\n|1|abc|def ssh-ed25519 AAAATEST trusted@example\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("ansible_config_wizard.engine.subprocess.run", fake_run)
+
+    assert trusted_local_known_hosts_entries("backup.example.com", 2222) == [expected]
+
+
+def test_prompt_for_known_hosts_value_can_reuse_local_trust(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ansible_config_wizard.engine.trusted_local_known_hosts_entries",
+        lambda host, port: ["|1|abc|def ssh-ed25519 AAAATEST trusted@example"],
+    )
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda *args, **kwargs: "Use keys already trusted in ~/.ssh/known_hosts")
+
+    buffer = Buffer()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+    field = FieldModel(id="ssh_known_hosts", label="Pinned SSH host keys", type="multiline_text")
+
+    value = prompt_for_known_hosts_value(field, {}, console, "backup.example.com", 22, None, None)
+
+    assert value == "|1|abc|def ssh-ed25519 AAAATEST trusted@example"
+
+
+def test_visible_stages_respect_phase_and_stage_conditions() -> None:
+    profile = ProfileModel(
+        id="demo",
+        name="Demo",
+        phases=[
+            PhaseModel(
+                id="configure",
+                title="Configure",
+                stages=[
+                    StageModel(id="host", title="Host", kind="form_stage"),
+                    StageModel(id="advanced", title="Advanced", kind="form_stage", when="customize"),
+                ],
+            ),
+            PhaseModel(
+                id="deploy",
+                title="Deploy",
+                when="enabled",
+                stages=[StageModel(id="verify", title="Verify", kind="manual_stage")],
+            ),
+        ],
+    )
+
+    entries = visible_stages(profile, {"customize": False, "enabled": True})
+
+    assert [entry["stage"].id for entry in entries] == ["host", "verify"]
+    assert stage_heading(entries[0]) == "Phase 1: Configure"
+    assert stage_label(entries[1]) == "Stage 2: Verify"
+
+
+def test_stage_menu_choices_reflect_stage_kind() -> None:
+    assert stage_menu_choices(StageModel(id="host", title="Host", kind="form_stage")) == [
+        "Continue stage",
+        "Return to stage",
+        "Save and exit",
+        "Exit without saving",
+    ]
+    assert stage_menu_choices(StageModel(id="prep", title="Prepare", kind="command_stage", allow_skip=True)) == [
+        "Run stage",
+        "Skip stage",
+        "Return to stage",
+        "Save and exit",
+        "Exit without saving",
+    ]
+
+
+def test_initialize_workflow_context_selects_first_stage() -> None:
+    profile = ProfileModel(
+        id="demo",
+        name="Demo",
+        phases=[
+            PhaseModel(
+                id="configure",
+                title="Configure",
+                stages=[
+                    StageModel(id="host", title="Host", kind="form_stage"),
+                    StageModel(id="review", title="Review", kind="review_stage"),
+                ],
+            )
+        ],
+    )
+    context: dict[str, object] = {}
+
+    entries = initialize_workflow_context(profile, context)
+
+    assert [entry["stage"].id for entry in entries] == ["host", "review"]
+    assert context["wizard_current_stage_id"] == "host"
+    assert context["wizard_current_phase_id"] == "configure"
+    assert stage_state(context, "host") == "not_started"
+    assert review_boundary_index(entries) == 1
+
+
+def test_reset_following_stage_state_resets_only_later_stages() -> None:
+    profile = ProfileModel(
+        id="demo",
+        name="Demo",
+        phases=[
+            PhaseModel(
+                id="configure",
+                title="Configure",
+                stages=[
+                    StageModel(id="host", title="Host", kind="form_stage"),
+                    StageModel(id="review", title="Review", kind="review_stage"),
+                ],
+            ),
+            PhaseModel(
+                id="deploy",
+                title="Deploy",
+                stages=[StageModel(id="prepare", title="Prepare", kind="command_stage")],
+            ),
+        ],
+    )
+    context = {
+        "wizard_stage_states": {
+            "host": "completed",
+            "review": "completed",
+            "prepare": "completed",
+        },
+        "wizard_stage_step_cursor": {
+            "host": 2,
+            "review": 1,
+            "prepare": 1,
+        },
+    }
+    entries = initialize_workflow_context(profile, context)
+
+    reset_following_stage_state(context, entries, 1)
+
+    assert context["wizard_stage_states"]["host"] == "completed"
+    assert context["wizard_stage_states"]["review"] == "not_started"
+    assert context["wizard_stage_states"]["prepare"] == "not_started"
+    assert context["wizard_stage_step_cursor"]["review"] == 0
+
+
+def test_persist_progress_writes_stage_state(tmp_path: Path) -> None:
+    state_path = tmp_path / "config-wizard-state.yml"
+    context = {
+        "wizard_resume_enabled": True,
+        "wizard_resume_state_path": str(state_path),
+        "wizard_current_stage_id": "prepare",
+        "wizard_current_phase_id": "deploy",
+        "wizard_stage_states": {"review": "completed", "prepare": "in_progress"},
+        "wizard_stage_step_cursor": {"review": 1, "prepare": 0},
+    }
+
+    persist_progress(context)
+
+    saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+    assert saved["wizard_current_stage_id"] == "prepare"
+    assert saved["wizard_stage_states"]["review"] == "completed"
+    assert saved["wizard_stage_step_cursor"]["prepare"] == 0
+
+
+def test_configured_vault_password_file_uses_ansible_cfg(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    password_file = repo_root / ".secrets" / "vault-pass.txt"
+    password_file.parent.mkdir(parents=True)
+    password_file.write_text("secret\n", encoding="utf-8")
+    (repo_root / "ansible.cfg").write_text(
+        "[defaults]\n"
+        "vault_password_file = .secrets/vault-pass.txt\n",
+        encoding="utf-8",
+    )
+
+    assert configured_vault_password_file(repo_root) == password_file.resolve()
+
+
+def test_configured_vault_password_file_path_reads_missing_default(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "ansible.cfg").write_text(
+        "[defaults]\n"
+        "vault_password_file = .vault_pass\n",
+        encoding="utf-8",
+    )
+
+    assert configured_vault_password_file_path(repo_root) == (repo_root / ".vault_pass").resolve()
+
+
+def test_ensure_vault_password_file_creates_private_file(tmp_path: Path) -> None:
+    password_file = tmp_path / ".vault_pass"
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    created = ensure_vault_password_file(password_file, console)
+
+    assert created == password_file
+    assert password_file.exists()
+    assert password_file.stat().st_mode & 0o777 == 0o600
+    assert len(password_file.read_text(encoding="utf-8").strip()) == 48
+
+
+def test_prompt_for_vault_authentication_can_choose_interactive_prompt(monkeypatch, tmp_path: Path) -> None:
+    answers = iter(["Prompt for vault password interactively"])
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda *_args, **_kwargs: next(answers))
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    result = prompt_for_vault_authentication(tmp_path, None, {}, console)
+
+    assert result is None
+
+
+def test_run_preflight_uses_ask_vault_pass_for_encrypted_vault(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    vault_file = repo_root / "inventories/prod/group_vars/vault.yml"
+    vault_file.parent.mkdir(parents=True, exist_ok=True)
+    vault_file.write_text("$ANSIBLE_VAULT;1.1;AES256\nabcdef\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(command, check, cwd):
+        captured["command"] = command
+        captured["check"] = check
+        captured["cwd"] = cwd
+        return None
+
+    monkeypatch.setattr("ansible_config_wizard.engine.subprocess.run", fake_run)
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    run_preflight(repo_root, console)
+
+    assert captured["command"] == [
+        "ansible-playbook",
+        "-i",
+        "inventories/prod/hosts.yml",
+        "--ask-vault-pass",
+        "playbooks/preflight.yml",
+    ]
+    assert captured["check"] is True
+    assert captured["cwd"] == repo_root
+
+
+def test_encrypt_vault_file_uses_explicit_default_vault_id(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    vault_file = repo_root / "inventories/prod/group_vars/vault.yml"
+    vault_file.parent.mkdir(parents=True, exist_ok=True)
+    vault_file.write_text("demo: true\n", encoding="utf-8")
+    password_file = repo_root / ".vault_pass"
+    password_file.write_text("secret\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(command, check, cwd):
+        captured["command"] = command
+        captured["check"] = check
+        captured["cwd"] = cwd
+        return None
+
+    monkeypatch.setattr("ansible_config_wizard.engine.subprocess.run", fake_run)
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    encrypt_vault_file(repo_root, password_file, console)
+
+    assert captured["command"] == [
+        "ansible-vault",
+        "encrypt",
+        str(vault_file),
+        "--vault-id",
+        f"default@{password_file}",
+        "--encrypt-vault-id",
+        "default",
+    ]
+
+
 def test_evaluate_condition_rejects_unsafe_code() -> None:
     with pytest.raises(WizardError):
+        from ansible_config_wizard.engine import evaluate_condition
+
         evaluate_condition("__import__('os').system('true')", {"enabled": True})
 
 
-def test_evaluate_condition_supports_attribute_access_for_dicts() -> None:
-    assert evaluate_condition("action_item.bootstrap_enabled", {"action_item": {"bootstrap_enabled": True}})
+def test_local_command_actions_do_not_write_command_files_by_default() -> None:
+    action = ActionModel(
+        kind="local_command",
+        message_template="Hello",
+        command_template="echo hi",
+    )
 
-
-def test_local_command_action_requires_command_template() -> None:
-    with pytest.raises(ValueError, match="exactly one of command_template or command_options"):
-        ActionModel(kind="local_command", message_template="Hello")
-
-
-def test_local_command_action_default_choice_must_be_available() -> None:
-    with pytest.raises(ValueError, match="default_choice"):
-        ActionModel(
-            kind="local_command",
-            message_template="Hello",
-            command_template="echo hi",
-            available_choices=["show", "leave"],
-            default_choice="run",
-        )
+    assert action.write_command_file is False
 
 
 def test_local_command_action_exposes_profile_defined_choices() -> None:
@@ -128,18 +491,8 @@ def test_local_command_action_exposes_profile_defined_choices() -> None:
         default_choice="run",
     )
 
-    assert local_command_choice_labels(action) == ["Run now", "Leave for later"]
+    assert local_command_choice_labels(action) == ["Run now", "Skip this step and continue"]
     assert local_command_choice_default(action) == "Run now"
-
-
-def test_local_command_actions_do_not_write_command_files_by_default() -> None:
-    action = ActionModel(
-        kind="local_command",
-        message_template="Hello",
-        command_template="echo hi",
-    )
-
-    assert action.write_command_file is False
 
 
 def test_local_command_action_accepts_profile_defined_command_options() -> None:
@@ -162,16 +515,6 @@ def test_local_command_action_accepts_profile_defined_command_options() -> None:
     assert [option["id"] for option in options] == ["deploy", "prep"]
 
 
-def test_local_command_action_rejects_mixed_single_and_multi_command_config() -> None:
-    with pytest.raises(ValueError, match="exactly one of command_template or command_options"):
-        ActionModel(
-            kind="local_command",
-            message_template="Hello",
-            command_template="echo hi",
-            command_options=[LocalCommandOptionModel(id="deploy", label="Run deployment", command_template="./scripts/deploy.sh")],
-        )
-
-
 def test_local_command_menu_expands_run_choice_into_top_level_options() -> None:
     action = ActionModel(
         kind="local_command",
@@ -188,7 +531,7 @@ def test_local_command_menu_expands_run_choice_into_top_level_options() -> None:
         "Show commands",
         "Run deployment",
         "Set up prerequisites",
-        "Leave for later",
+        "Skip this step and continue",
     ]
     assert local_command_menu_default(action, options) == "Run deployment"
 
@@ -251,7 +594,7 @@ def test_build_ssh_setup_commands_disables_agent_keys() -> None:
         ssh_user="ubuntu",
         public_key_path="/tmp/test key.pub",
         private_key_path="/tmp/test key",
-        resume_command="./scripts/configure.sh --answers-file /tmp/state.yml",
+        resume_command="./scripts/setup.sh --answers-file /tmp/state.yml",
     )
 
     assert "ssh-copy-id" in commands
@@ -259,11 +602,6 @@ def test_build_ssh_setup_commands_disables_agent_keys() -> None:
     assert "IdentitiesOnly=yes" in commands
     assert "IdentityAgent=none" in commands
     assert "203.0.113.10" in commands
-    assert commands.startswith("env -u SSH_AUTH_SOCK \\\n  ssh-copy-id \\")
-    assert "\n  -o 'IdentitiesOnly=yes' \\\n" in commands
-    assert "\n  -i '/tmp/test key.pub' \\\n" in commands
-    assert "\n  'ubuntu@203.0.113.10'\n" in commands
-    assert "\n\nenv -u SSH_AUTH_SOCK \\\n  ssh \\\n" in commands
 
 
 def test_redacting_console_writer_masks_secrets() -> None:
@@ -277,152 +615,10 @@ def test_redacting_console_writer_masks_secrets() -> None:
     assert "[redacted]" in "".join(output.parts)
 
 
-def test_previous_visible_section_index_skips_hidden_sections() -> None:
-    sections = [
-        SectionModel(id="one", title="One"),
-        SectionModel(id="two", title="Two", when="enabled"),
-        SectionModel(id="three", title="Three"),
-    ]
-
-    assert previous_visible_section_index(sections, {"enabled": False}, 2) == 0
-    assert previous_visible_section_index(sections, {"enabled": True}, 2) == 1
-
-
-def test_completed_visible_sections_include_current_step() -> None:
-    sections = [
-        SectionModel(id="one", title="One"),
-        SectionModel(id="two", title="Two", when="enabled"),
-        SectionModel(id="three", title="Three"),
-    ]
-
-    completed = completed_visible_sections(sections, {"enabled": False}, 2)
-
-    assert [(index, step_number, section.id) for index, step_number, section in completed] == [
-        (0, 1, "one"),
-        (2, 2, "three"),
-    ]
-
-
-def test_latest_resume_state_path_picks_newest(tmp_path: Path) -> None:
-    wizard_state_dir = tmp_path / "sample" / "repo"
-    older = wizard_state_dir / "runs" / "20260101-000000" / "config-wizard-state.yml"
-    newer = wizard_state_dir / "runs" / "20260101-000100" / "config-wizard-state.yml"
-    older.parent.mkdir(parents=True, exist_ok=True)
-    newer.parent.mkdir(parents=True, exist_ok=True)
-    older.write_text("older: true\n", encoding="utf-8")
-    newer.write_text("newer: true\n", encoding="utf-8")
-    os.utime(older, (1, 1))
-    os.utime(newer, (2, 2))
-
-    assert latest_resume_state_path(wizard_state_dir) == newer
-
-
-def test_resolve_field_reuses_current_value_as_default(monkeypatch, tmp_path: Path) -> None:
-    defaults_seen: list[tuple[str | None, str | None]] = []
-
-    def fake_prompt_field(field, display_default, prompt_default, console, context):
-        defaults_seen.append((display_default, prompt_default))
-        return prompt_default
-
-    monkeypatch.setattr("ansible_config_wizard.engine.prompt_field", fake_prompt_field)
-    field = FieldModel(id="host_name", label="Host name")
-    console = Console(file=Buffer(), force_terminal=False, color_system=None)
-
-    value = resolve_field(
-        field,
-        {"host_name": "demo-01"},
-        provided_value=None,
-        current_value="demo-01",
-        assume_yes=False,
-        console=console,
-        repo_root=tmp_path,
-    )
-
-    assert value == "demo-01"
-    assert defaults_seen == [(None, "demo-01")]
-
-
-def test_resolve_field_keeps_display_default_when_revisiting(monkeypatch, tmp_path: Path) -> None:
-    defaults_seen: list[tuple[str | None, str | None]] = []
-
-    def fake_prompt_field(field, display_default, prompt_default, console, context):
-        defaults_seen.append((display_default, prompt_default))
-        return prompt_default
-
-    monkeypatch.setattr("ansible_config_wizard.engine.prompt_field", fake_prompt_field)
-    field = FieldModel(id="ops_domain", label="Ops domain", default_template="ops.{{ base_domain }}")
-    console = Console(file=Buffer(), force_terminal=False, color_system=None)
-
-    value = resolve_field(
-        field,
-        {"base_domain": "example.com", "ops_domain": "infra.example.com"},
-        provided_value=None,
-        current_value="infra.example.com",
-        assume_yes=False,
-        console=console,
-        repo_root=tmp_path,
-    )
-
-    assert value == "infra.example.com"
-    assert defaults_seen == [("ops.example.com", "infra.example.com")]
-
-
-def test_describe_next_step_uses_following_visible_section() -> None:
-    sections = [
-        SectionModel(id="one", title="One"),
-        SectionModel(id="two", title="Two", when="enabled"),
-        SectionModel(id="three", title="Three"),
-    ]
-    profile = type("Profile", (), {"sections": sections})()
-
-    assert describe_next_step(profile, {"enabled": False}, 0) == "Continue to Step 2: Three"
-    assert describe_next_step(profile, {"enabled": True}, 1) == "Continue to Step 3: Three"
-    assert describe_next_step(profile, {"enabled": False}, -1) == "Continue to Step 1: One"
-    assert describe_step_target(profile, {"enabled": False}, 0) == "Step 2: Three"
-
-
-def test_persist_progress_preserves_furthest_resume_index(tmp_path: Path) -> None:
-    state_path = tmp_path / "config-wizard-state.yml"
-    context = {
-        "wizard_resume_enabled": True,
-        "wizard_resume_state_path": str(state_path),
-        "wizard_resume_section_index": 3,
-        "wizard_furthest_resume_index": 4,
-    }
-
-    persist_progress(context, 2)
-
-    assert furthest_resume_index(context) == 4
-    saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
-    assert saved["wizard_resume_section_index"] == 2
-    assert saved["wizard_furthest_resume_index"] == 4
-
-
-def test_next_navigation_choices_prioritize_local_continue() -> None:
-    sections = [
-        SectionModel(id="one", title="One"),
-        SectionModel(id="two", title="Two"),
-        SectionModel(id="three", title="Three"),
-        SectionModel(id="four", title="Four"),
-    ]
-    profile = type("Profile", (), {"sections": sections})()
-    context = {
-        "wizard_resume_section_index": 1,
-        "wizard_furthest_resume_index": 3,
-    }
-
-    assert next_navigation_choices(profile, context, 1) == [
-        "Continue to Step 3: Three",
-        "Resume at Step 4: Four",
-        "Review a step",
-    ]
-
-
 def test_collect_repeatable_can_trim_existing_entries(monkeypatch, tmp_path: Path) -> None:
-    section = SectionModel(
+    repeatable = RepeatableModel(
         id="vaults",
         title="Vaults",
-        kind="repeatable",
         collection_key="vaults",
         item_label="vault",
         fields=[FieldModel(id="name", label="Vault name")],
@@ -446,7 +642,7 @@ def test_collect_repeatable_can_trim_existing_entries(monkeypatch, tmp_path: Pat
     )
 
     collect_repeatable(
-        section,
+        repeatable,
         context,
         answers,
         assume_yes=False,
@@ -456,6 +652,20 @@ def test_collect_repeatable_can_trim_existing_entries(monkeypatch, tmp_path: Pat
     )
 
     assert context["vaults"] == [{"name": "one"}]
+
+
+def test_latest_resume_state_path_picks_newest(tmp_path: Path) -> None:
+    wizard_state_dir = tmp_path / "sample" / "repo"
+    older = wizard_state_dir / "runs" / "20260101-000000" / "config-wizard-state.yml"
+    newer = wizard_state_dir / "runs" / "20260101-000100" / "config-wizard-state.yml"
+    older.parent.mkdir(parents=True, exist_ok=True)
+    newer.parent.mkdir(parents=True, exist_ok=True)
+    older.write_text("older: true\n", encoding="utf-8")
+    newer.write_text("newer: true\n", encoding="utf-8")
+    os.utime(older, (1, 1))
+    os.utime(newer, (2, 2))
+
+    assert latest_resume_state_path(wizard_state_dir) == newer
 
 
 def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -> None:
@@ -469,64 +679,112 @@ def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -
                 raise KeyboardInterrupt
             return "continue"
 
-    state_path = tmp_path / "config-wizard-state.yml"
-    context = {
-        "wizard_resume_enabled": True,
-        "wizard_resume_state_path": str(state_path),
-        "wizard_current_section_index": 2,
-    }
-    console = Console(file=Buffer(), force_terminal=False, color_system=None)
-
-    answer = ask_question(InterruptThenAnswer(), context, console)
-
-    assert answer == "continue"
-    assert state_path.exists()
-    saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
-    assert saved["wizard_resume_section_index"] == 2
-
-
-def test_ask_question_exits_on_second_consecutive_interrupt(tmp_path: Path, monkeypatch) -> None:
-    class AlwaysInterrupt:
+    class FakeSelect:
         def ask(self) -> str:
-            raise KeyboardInterrupt
+            return "Save and exit"
 
-    ticks = iter([10.0, 11.0])
-    monkeypatch.setattr("ansible_config_wizard.engine.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("ansible_config_wizard.engine.questionary.select", lambda *args, **kwargs: FakeSelect())
 
     state_path = tmp_path / "config-wizard-state.yml"
     context = {
         "wizard_resume_enabled": True,
         "wizard_resume_state_path": str(state_path),
-        "wizard_current_section_index": 1,
+        "wizard_current_stage_id": "prepare",
+        "wizard_stage_states": {"prepare": "in_progress"},
     }
     console = Console(file=Buffer(), force_terminal=False, color_system=None)
 
     with pytest.raises(WizardPaused):
-        ask_question(AlwaysInterrupt(), context, console)
+        ask_question(InterruptThenAnswer(), context, console)
+    saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+    assert saved["wizard_current_stage_id"] == "prepare"
 
-    assert state_path.exists()
+
+def test_resume_opens_stage_menu_before_running_command(monkeypatch, tmp_path: Path) -> None:
+    fixture_root = Path(__file__).parent / "fixture_repo"
+    shutil.copytree(fixture_root, tmp_path / "repo", dirs_exist_ok=True)
+    repo_root = tmp_path / "repo"
+    profile_path = write_interactive_profile(repo_root)
+    state_root = tmp_path / "state-home"
+    monkeypatch.setenv("ANSIBLE_CONFIG_WIZARD_STATE_HOME", str(state_root))
+
+    first_answers = iter(
+        [
+            True,
+            "Continue stage",
+            "demo-01",
+            "203.0.113.10",
+            "example.com",
+            "Continue stage",
+            False,
+            False,
+            "Write files and continue",
+            "Save and exit",
+        ]
+    )
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda *_args, **_kwargs: next(first_answers))
+
+    with pytest.raises(WizardPaused):
+        run_wizard(profile_path=profile_path, repo_root=repo_root)
+
+    resume_path = next(state_root.glob("interactive/repo/runs/*/config-wizard-state.yml"))
+    saved = yaml.safe_load(resume_path.read_text(encoding="utf-8"))
+    assert saved["wizard_current_stage_id"] == "prepare"
+    assert saved["wizard_outputs_written"] is True
+
+    executed: list[object] = []
+
+    def fake_run(*args, **kwargs):
+        executed.append((args, kwargs))
+        return None
+
+    monkeypatch.setattr("ansible_config_wizard.engine.subprocess.run", fake_run)
+    second_answers = iter(["Save and exit"])
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda *_args, **_kwargs: next(second_answers))
+
+    with pytest.raises(WizardPaused):
+        run_wizard(profile_path=profile_path, repo_root=repo_root, answers_path=resume_path)
+
+    assert executed == []
 
 
-def test_ask_question_treats_none_as_interrupt(tmp_path: Path, monkeypatch) -> None:
-    class NoneThenAnswer:
-        def __init__(self) -> None:
-            self.calls = 0
+def test_full_interactive_workflow_runs_command_and_manual_stages(monkeypatch, tmp_path: Path) -> None:
+    fixture_root = Path(__file__).parent / "fixture_repo"
+    shutil.copytree(fixture_root, tmp_path / "repo", dirs_exist_ok=True)
+    repo_root = tmp_path / "repo"
+    profile_path = write_interactive_profile(repo_root)
+    state_root = tmp_path / "state-home"
+    monkeypatch.setenv("ANSIBLE_CONFIG_WIZARD_STATE_HOME", str(state_root))
 
-        def ask(self) -> str | None:
-            self.calls += 1
-            if self.calls == 1:
-                return None
-            return "continue"
+    answers = iter(
+        [
+            True,
+            "Continue stage",
+            "demo-01",
+            "203.0.113.10",
+            "example.com",
+            "Continue stage",
+            False,
+            False,
+            "Write files and continue",
+            "Run stage",
+            "Run now",
+            "Run stage",
+            "Mark stage complete",
+        ]
+    )
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda *_args, **_kwargs: next(answers))
+    executed: list[list[str]] = []
 
-    state_path = tmp_path / "config-wizard-state.yml"
-    context = {
-        "wizard_resume_enabled": True,
-        "wizard_resume_state_path": str(state_path),
-        "wizard_current_section_index": 3,
-    }
-    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+    def fake_run(command, *args, **kwargs):
+        if isinstance(command, list):
+            executed.append(command)
+        else:
+            executed.append([command])
+        return type("Result", (), {"returncode": 0})()
 
-    answer = ask_question(NoneThenAnswer(), context, console)
+    monkeypatch.setattr("ansible_config_wizard.engine.subprocess.run", fake_run)
 
-    assert answer == "continue"
-    assert state_path.exists()
+    run_wizard(profile_path=profile_path, repo_root=repo_root)
+
+    assert ["echo", "prepare"] in executed

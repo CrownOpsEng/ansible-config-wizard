@@ -13,7 +13,7 @@ License: MIT. See [LICENSE](LICENSE).
 
 This package owns the generic workflow:
 
-- schema-driven sections and fields
+- schema-driven phases, stages, and fields
 - branching prompt flow
 - local secret generation
 - generated SSH keypair materialization for first-run bootstrap flows
@@ -84,6 +84,8 @@ uv run --project ../ansible-config-wizard ansible-config-wizard \
   --profile ./wizard_profiles/site.yml \
   --repo-root .
 ```
+
+When `inventories/prod/group_vars/vault.yml` is already encrypted, the wizard will either use `--vault-password-file`, an `ANSIBLE_VAULT_PASSWORD_FILE` / `ansible.cfg` default, or fall back to Ansible's interactive vault password prompt during preflight.
 
 The `builder` field in the profile should reference a callable using `module:callable` syntax, for example:
 
