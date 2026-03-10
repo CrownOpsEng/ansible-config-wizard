@@ -1213,28 +1213,35 @@ def run_local_command_action(
     working_directory = None
     if action.working_directory_template:
         working_directory = Path(render_template_string(action.working_directory_template, action_context))
+    command_path = write_command_file(action_name, command, action_context) if command else None
 
     show_manual = False
     while True:
         console.print(Rule("[bold cyan]Optional Setup[/bold cyan]"))
         console.print(message, soft_wrap=True, highlight=False)
         console.print()
+        if command_path is not None:
+            console.print(f"[cyan]Prepared command file[/cyan] {command_path}")
+            console.print()
         console.print(
-            "Run it now to let Ansible make the remote changes. You can also view the command and handle it later.",
+            "The wizard has prepared the next-step command. You can inspect it now, run it immediately, or leave it for later.",
             style="dim",
         )
         if show_manual and command:
-            render_manual_action_commands(action_name, command, action_context, console)
+            console.print()
+            console.print("[cyan]Follow-up command[/cyan]")
+            console.print(command, markup=False, highlight=False, no_wrap=True, overflow="ignore")
+            console.print()
 
         choice = ask_question(
             questionary.select(
                 action.prompt,
                 choices=[
-                    "Run now (recommended)",
                     "Show command",
-                    "Skip for now",
+                    "Run now",
+                    "Leave for later",
                 ],
-                default="Run now (recommended)",
+                default="Show command",
             ),
             context,
             console,
@@ -1243,7 +1250,7 @@ def run_local_command_action(
         if choice == "Show command":
             show_manual = True
             continue
-        if choice == "Skip for now":
+        if choice == "Leave for later":
             return
         try:
             run_local_command(command, working_directory, console)
@@ -1256,7 +1263,7 @@ def run_local_command_action(
                     choices=[
                         "Show command",
                         "Try again",
-                        "Skip for now",
+                        "Leave for later",
                     ],
                     default="Show command",
                 ),
@@ -1266,7 +1273,7 @@ def run_local_command_action(
             console.print()
             if follow_up == "Try again":
                 continue
-            if follow_up == "Skip for now":
+            if follow_up == "Leave for later":
                 return
             continue
         return
