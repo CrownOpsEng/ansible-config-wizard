@@ -400,22 +400,13 @@ def collect_repeatable(
         return
 
     count_default = max(len(existing_items), section.default_count, section.min_items)
-    if assume_yes:
-        count = count_default
-    else:
+    if not assume_yes:
         console.print(
-            f"We'll set these up one at a time so the values stay easy to reason about.",
+            "We'll set these up one at a time so the values stay easy to reason about.",
             style="dim",
         )
-        count = int(
-            questionary.text(
-                f"{section.title}: how many {section.item_label}s?",
-                default=str(count_default),
-            ).ask()
-        )
-    count = max(count, section.min_items)
 
-    for index in range(1, count + 1):
+    def prompt_repeatable_item(index: int, existing_item: dict[str, Any] | None = None) -> dict[str, Any]:
         console.print(
             Panel.fit(
                 f"{section.item_label.title()} {index}",
@@ -426,13 +417,31 @@ def collect_repeatable(
         item_context = copy.deepcopy(context)
         item_context["item_index"] = index
         item: dict[str, Any] = {}
-        existing_item = existing_items[index - 1] if index - 1 < len(existing_items) else {}
+        existing_item = existing_item or {}
         for field in section.fields:
             if not evaluate_condition(field.when, {**item_context, **item}):
                 continue
             provided = copy.deepcopy(existing_item.get(field.id)) if field.id in existing_item else None
             item[field.id] = resolve_field(field, {**item_context, **item}, provided, assume_yes, console, repo_root)
-        items.append(item)
+        return item
+
+    for index in range(1, count_default + 1):
+        existing_item = existing_items[index - 1] if index - 1 < len(existing_items) else {}
+        items.append(prompt_repeatable_item(index, existing_item))
+
+    next_index = count_default + 1
+    while not assume_yes:
+        console.print()
+        add_another = questionary.confirm(
+            f"Add another {section.item_label}?",
+            default=False,
+        ).ask()
+        console.print()
+        if not add_another:
+            break
+        items.append(prompt_repeatable_item(next_index))
+        next_index += 1
+
     context[collection_key] = items
     answered_collections.add(collection_key)
 
@@ -628,6 +637,21 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
         if action.commands_template
         else build_ssh_setup_commands(host, ssh_user, public_key_path, private_key_path, resume_command)
     )
+    login_command = format_shell_command(
+        [
+            "env",
+            "-u",
+            "SSH_AUTH_SOCK",
+            "ssh",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityAgent=none",
+            "-i",
+            private_key_path,
+            f"{ssh_user}@{host}",
+        ]
+    )
     manual_requested = False
 
     while True:
@@ -673,6 +697,10 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
                     pause_wizard(action, context, console)
                 continue
             console.print("[green]Managed SSH key installed and verified.[/green]")
+            console.print()
+            console.print("[cyan]Direct login check[/cyan]")
+            console.print(login_command, soft_wrap=True, highlight=False)
+            console.print()
             return
         if choice == "Show manual steps":
             manual_requested = True
