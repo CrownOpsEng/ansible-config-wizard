@@ -13,7 +13,7 @@ License: MIT. See [LICENSE](LICENSE).
 
 This package owns the generic workflow:
 
-- schema-driven sections and fields
+- schema-driven phases, stages, and fields
 - branching prompt flow
 - local secret generation
 - generated SSH keypair materialization for first-run bootstrap flows

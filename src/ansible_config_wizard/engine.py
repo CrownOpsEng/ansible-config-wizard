@@ -25,7 +25,15 @@ from rich.panel import Panel
 from rich.rule import Rule
 
 from .generators import generate_password, generate_value, load_ed25519_keypair
-from .models import ActionModel, FieldModel, OutputModel, ProfileModel, SectionModel
+from .models import (
+    ActionModel,
+    FieldModel,
+    OutputModel,
+    PhaseModel,
+    ProfileModel,
+    RepeatableModel,
+    StageModel,
+)
 from .resolver import resolve_builder
 from .writers import atomic_write, backup_existing, secure_delete
 
@@ -133,36 +141,25 @@ def latest_resume_state_path(wizard_state_dir: Path) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def current_section_index(context: dict[str, Any]) -> int:
-    return int(context.get("wizard_current_section_index", 0))
+def current_stage_id(context: dict[str, Any]) -> str | None:
+    value = context.get("wizard_current_stage_id")
+    return str(value) if value else None
 
 
-def furthest_resume_index(context: dict[str, Any]) -> int:
-    return int(context.get("wizard_furthest_resume_index", context.get("wizard_resume_section_index", 0)))
-
-
-def write_resume_state(context: dict[str, Any], section_index: int | None = None) -> Path:
+def write_resume_state(context: dict[str, Any]) -> Path:
     path = Path(context["wizard_resume_state_path"])
     ensure_private_dir(path.parent)
     snapshot = copy.deepcopy(context)
     snapshot["wizard_resume_enabled"] = True
     snapshot["wizard_resume_state"] = True
-    snapshot["wizard_resume_section_index"] = current_section_index(context) if section_index is None else section_index
-    snapshot["wizard_furthest_resume_index"] = max(
-        int(snapshot["wizard_resume_section_index"]),
-        int(snapshot.get("wizard_furthest_resume_index", 0)),
-    )
     atomic_write(path, yaml.safe_dump(snapshot, sort_keys=False), 0o600)
     return path
 
 
-def persist_progress(context: dict[str, Any], section_index: int | None = None) -> Path | None:
+def persist_progress(context: dict[str, Any]) -> Path | None:
     if not context.get("wizard_resume_enabled"):
         return None
-    if section_index is not None:
-        context["wizard_resume_section_index"] = section_index
-        context["wizard_furthest_resume_index"] = max(section_index, furthest_resume_index(context))
-    return write_resume_state(context, section_index)
+    return write_resume_state(context)
 
 
 def save_and_exit(context: dict[str, Any], console: Console) -> None:
@@ -792,7 +789,7 @@ def resolve_field(
 
 
 def collect_fields(
-    section: SectionModel,
+    stage: StageModel,
     context: dict[str, Any],
     answers: dict[str, Any],
     assume_yes: bool,
@@ -800,7 +797,7 @@ def collect_fields(
     repo_root: Path,
     answered_fields: set[str],
 ) -> None:
-    for field in section.fields:
+    for field in stage.fields:
         if not evaluate_condition(field.when, context):
             continue
         provided = answers.get(field.id) if field.id in answers else None
@@ -811,7 +808,7 @@ def collect_fields(
 
 
 def collect_repeatable(
-    section: SectionModel,
+    repeatable: RepeatableModel,
     context: dict[str, Any],
     answers: dict[str, Any],
     assume_yes: bool,
@@ -819,7 +816,7 @@ def collect_repeatable(
     repo_root: Path,
     answered_collections: set[str],
 ) -> None:
-    collection_key = section.collection_key or section.id
+    collection_key = repeatable.collection_key or repeatable.id
     existing_items = copy.deepcopy(context.get(collection_key, []))
     provided_items = answers.get(collection_key) if collection_key in answers else None
     items: list[dict[str, Any]] = []
@@ -829,7 +826,7 @@ def collect_repeatable(
             item_context = copy.deepcopy(context)
             item_context["item_index"] = index
             item: dict[str, Any] = {}
-            for field in section.fields:
+            for field in repeatable.fields:
                 if not evaluate_condition(field.when, {**item_context, **item}):
                     continue
                 item[field.id] = resolve_field(
@@ -846,7 +843,7 @@ def collect_repeatable(
         answered_collections.add(collection_key)
         return
 
-    if assume_yes and section.default_count == 0 and section.min_items == 0:
+    if assume_yes and repeatable.default_count == 0 and repeatable.min_items == 0:
         context[collection_key] = []
         answered_collections.add(collection_key)
         return
@@ -873,7 +870,7 @@ def collect_repeatable(
     def prompt_repeatable_item(index: int, existing_item: dict[str, Any] | None = None) -> dict[str, Any]:
         console.print(
             Panel.fit(
-                f"{section.item_label.title()} {index}",
+                f"{repeatable.item_label.title()} {index}",
                 border_style="cyan",
                 box=box.ROUNDED,
             )
@@ -887,7 +884,7 @@ def collect_repeatable(
             if provided_items is not None and index - 1 < len(provided_items)
             else {}
         )
-        for field in section.fields:
+        for field in repeatable.fields:
             if not evaluate_condition(field.when, {**item_context, **item}):
                 continue
             provided = copy.deepcopy(provided_item.get(field.id)) if field.id in provided_item else None
@@ -904,14 +901,14 @@ def collect_repeatable(
         return item
 
     existing_limit = len(seed_items)
-    if seed_items and not assume_yes and section.min_items == 0:
+    if seed_items and not assume_yes and repeatable.min_items == 0:
         console.print(
-            f"You already have {len(seed_items)} saved {section.item_label} entr{'y' if len(seed_items) == 1 else 'ies'}.",
+            f"You already have {len(seed_items)} saved {repeatable.item_label} entr{'y' if len(seed_items) == 1 else 'ies'}.",
             style="dim",
         )
         keep_existing = ask_question(
             questionary.confirm(
-                f"Start by reviewing those existing {section.item_label} entries?",
+                f"Start by reviewing those existing {repeatable.item_label} entries?",
                 default=True,
             ),
             context,
@@ -925,12 +922,12 @@ def collect_repeatable(
         existing_item = seed_items[index - 1]
         items.append(prompt_repeatable_item(index, existing_item))
         remaining_existing = existing_limit - index
-        required_remaining = max(section.min_items - len(items), 0)
+        required_remaining = max(repeatable.min_items - len(items), 0)
         if remaining_existing > 0 and required_remaining == 0 and not assume_yes:
             console.print()
             review_next = ask_question(
                 questionary.confirm(
-                    f"Keep another existing {section.item_label}?",
+                    f"Keep another existing {repeatable.item_label}?",
                     default=True,
                 ),
                 context,
@@ -940,7 +937,7 @@ def collect_repeatable(
             if not review_next:
                 break
 
-    required_count = section.min_items if seed_items else max(section.min_items, section.default_count)
+    required_count = repeatable.min_items if seed_items else max(repeatable.min_items, repeatable.default_count)
     next_index = len(items) + 1
     while len(items) < required_count:
         items.append(prompt_repeatable_item(next_index))
@@ -949,7 +946,7 @@ def collect_repeatable(
         console.print()
         add_another = ask_question(
             questionary.confirm(
-                f"Add another {section.item_label}?",
+                f"Add another {repeatable.item_label}?",
                 default=False,
             ),
             context,
@@ -965,136 +962,142 @@ def collect_repeatable(
     answered_collections.add(collection_key)
 
 
-def previous_visible_section_index(sections: list[SectionModel], context: dict[str, Any], current_index: int) -> int | None:
-    for index in range(current_index - 1, -1, -1):
-        if evaluate_condition(sections[index].when, context):
-            return index
-    return None
+def stage_state(context: dict[str, Any], stage_id: str) -> str:
+    return str(context.setdefault("wizard_stage_states", {}).get(stage_id, "not_started"))
 
 
-def completed_visible_sections(
-    sections: list[SectionModel],
-    context: dict[str, Any],
-    current_index: int,
-) -> list[tuple[int, int, SectionModel]]:
-    completed: list[tuple[int, int, SectionModel]] = []
-    step_number = 0
-    for index, section in enumerate(sections):
-        if not evaluate_condition(section.when, context):
+def set_stage_state(context: dict[str, Any], stage_id: str, state: str) -> None:
+    context.setdefault("wizard_stage_states", {})[stage_id] = state
+
+
+def set_stage_cursor(context: dict[str, Any], stage_id: str, cursor: int) -> None:
+    context.setdefault("wizard_stage_step_cursor", {})[stage_id] = cursor
+
+
+def visible_stages(profile: ProfileModel, context: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    phase_number = 0
+    stage_number = 0
+    for phase in profile.phases:
+        if not evaluate_condition(phase.when, context):
             continue
-        step_number += 1
-        if index <= current_index:
-            completed.append((index, step_number, section))
-    return completed
+        visible_phase_stages = [stage for stage in phase.stages if evaluate_condition(stage.when, context)]
+        if not visible_phase_stages:
+            continue
+        phase_number += 1
+        for phase_stage_number, stage in enumerate(visible_phase_stages, start=1):
+            stage_number += 1
+            entries.append(
+                {
+                    "phase": phase,
+                    "stage": stage,
+                    "phase_number": phase_number,
+                    "phase_stage_number": phase_stage_number,
+                    "stage_number": stage_number,
+                }
+            )
+    return entries
 
 
-def choose_completed_section(
+def stage_label(entry: dict[str, Any]) -> str:
+    return f"Stage {entry['stage_number']}: {entry['stage'].title}"
+
+
+def stage_heading(entry: dict[str, Any]) -> str:
+    return f"Phase {entry['phase_number']}: {entry['phase'].title}"
+
+
+def stage_menu_choices(stage: StageModel) -> list[str]:
+    if stage.kind in {"command_stage", "manual_stage"}:
+        choices = ["Run stage"]
+        if stage.allow_skip:
+            choices.append("Skip stage")
+    else:
+        choices = ["Continue stage"]
+    choices.extend(["Return to stage", "Save and exit", "Exit without saving"])
+    return choices
+
+
+def initialize_workflow_context(profile: ProfileModel, context: dict[str, Any]) -> list[dict[str, Any]]:
+    entries = visible_stages(profile, context)
+    known_ids = {entry["stage"].id for entry in entries}
+    states = context.setdefault("wizard_stage_states", {})
+    cursors = context.setdefault("wizard_stage_step_cursor", {})
+    for stage_id in list(states):
+        if stage_id not in known_ids:
+            states.pop(stage_id, None)
+    for stage_id in list(cursors):
+        if stage_id not in known_ids:
+            cursors.pop(stage_id, None)
+    for entry in entries:
+        states.setdefault(entry["stage"].id, "not_started")
+        cursors.setdefault(entry["stage"].id, 0)
+    current_id = current_stage_id(context)
+    if current_id not in known_ids:
+        if entries:
+            context["wizard_current_stage_id"] = entries[0]["stage"].id
+            context["wizard_current_phase_id"] = entries[0]["phase"].id
+        else:
+            context["wizard_current_stage_id"] = None
+            context["wizard_current_phase_id"] = None
+    return entries
+
+
+def current_stage_index(entries: list[dict[str, Any]], context: dict[str, Any]) -> int:
+    current_id = current_stage_id(context)
+    for index, entry in enumerate(entries):
+        if entry["stage"].id == current_id:
+            return index
+    return 0
+
+
+def set_current_stage(context: dict[str, Any], entry: dict[str, Any]) -> None:
+    context["wizard_current_stage_id"] = entry["stage"].id
+    context["wizard_current_phase_id"] = entry["phase"].id
+
+
+def reset_following_stage_state(context: dict[str, Any], entries: list[dict[str, Any]], start_index: int) -> None:
+    states = context.setdefault("wizard_stage_states", {})
+    cursors = context.setdefault("wizard_stage_step_cursor", {})
+    for entry in entries[start_index:]:
+        states[entry["stage"].id] = "not_started"
+        cursors[entry["stage"].id] = 0
+
+
+def choose_return_stage(
     profile: ProfileModel,
     context: dict[str, Any],
-    current_index: int,
-    resume_index: int,
     console: Console,
-) -> int | None:
-    completed = completed_visible_sections(profile.sections, context, current_index)
-    labels: list[str] = []
-    label_to_index: dict[str, int] = {}
-    if resume_index <= len(profile.sections):
-        resume_label = f"Resume at {describe_step_target(profile, context, resume_index - 1)}"
-        labels.append(resume_label)
-        label_to_index[resume_label] = resume_index
-    for index, step_number, section in completed:
-        label = f"Review Step {step_number}: {section.title}"
-        labels.append(label)
-        label_to_index[label] = index
-    if not labels:
+    current_index: int,
+) -> dict[str, Any] | None:
+    entries = initialize_workflow_context(profile, context)
+    reachable = entries[: current_index + 1]
+    if not reachable:
         return None
 
-    console.print()
-    choice = ask_question(
-        questionary.select(
-            "Pick a step to revisit, or jump back to your furthest saved point.",
-            choices=labels,
-            default=labels[0],
-        ),
-        context,
-        console,
-    )
-    console.print()
-    return label_to_index[choice]
-
-
-def describe_next_step(profile: ProfileModel, context: dict[str, Any], current_index: int) -> str:
-    for index in range(current_index + 1, len(profile.sections)):
-        section = profile.sections[index]
-        if evaluate_condition(section.when, context):
-            step_number = sum(
-                1 for item in profile.sections[: index + 1] if evaluate_condition(item.when, context)
-            )
-            return f"Continue to Step {step_number}: {section.title}"
-    return "Continue to setup stages"
-
-
-def describe_step_target(profile: ProfileModel, context: dict[str, Any], current_index: int) -> str:
-    label = describe_next_step(profile, context, current_index)
-    if label.startswith("Continue to "):
-        return label.removeprefix("Continue to ")
-    return "setup stages"
-
-
-def choose_resume_section(
-    profile: ProfileModel,
-    context: dict[str, Any],
-    resume_index: int,
-    console: Console,
-) -> int:
-    completed = completed_visible_sections(profile.sections, context, resume_index - 1)
-    choices: list[str] = []
-    label_to_index: dict[str, int] = {}
-
-    continue_label = f"Resume at {describe_step_target(profile, context, resume_index - 1)}"
-    choices.append(continue_label)
-    label_to_index[continue_label] = resume_index
-
-    for index, step_number, section in completed:
-        label = f"Review Step {step_number}: {section.title}"
+    choices: list[Any] = []
+    label_to_stage: dict[str, dict[str, Any]] = {}
+    last_phase_id = None
+    for entry in reachable:
+        if entry["phase"].id != last_phase_id:
+            choices.append(questionary.Separator(f" {stage_heading(entry)} "))
+            last_phase_id = entry["phase"].id
+        label = stage_label(entry)
         choices.append(label)
-        label_to_index[label] = index
+        label_to_stage[label] = entry
 
-    console.print()
-    console.print("[bold]Resume point[/bold]", style="cyan")
-    console.print(
-        "Continue from your furthest saved point, or reopen any finished step with your current answers prefilled.",
-        style="dim",
-    )
     console.print()
     selection = ask_question(
         questionary.select(
-            "Where do you want to begin?",
+            "Return to stage",
             choices=choices,
-            default=continue_label,
+            default=stage_label(reachable[-1]),
         ),
         context,
         console,
     )
     console.print()
-    return label_to_index[selection]
-
-
-def next_navigation_choices(profile: ProfileModel, context: dict[str, Any], current_index: int) -> list[str]:
-    choices: list[str] = []
-    direct_next = describe_next_step(profile, context, current_index)
-    choices.append(direct_next)
-
-    resume_index = furthest_resume_index(context)
-    resume_label = f"Resume at {describe_step_target(profile, context, resume_index - 1)}"
-    if resume_index != current_index + 1 and resume_label != direct_next:
-        choices.append(resume_label)
-
-    if completed_visible_sections(profile.sections, context, resume_index - 1):
-        choices.append("Review a step")
-    choices.append("Save progress and exit")
-    choices.append("Exit without saving progress")
-    return choices
+    return label_to_stage.get(selection)
 
 
 def write_command_file(name: str, commands: str, context: dict[str, Any]) -> Path:
@@ -1102,10 +1105,6 @@ def write_command_file(name: str, commands: str, context: dict[str, Any]) -> Pat
     script = "#!/usr/bin/env bash\nset -euo pipefail\n\n" + commands.strip() + "\n"
     atomic_write(path, script, 0o700)
     return path
-
-
-def write_action_commands(section: SectionModel, commands: str, context: dict[str, Any]) -> Path:
-    return write_command_file(section.id, commands, context)
 
 
 def ssh_command_env() -> dict[str, str]:
@@ -1307,7 +1306,7 @@ def pause_wizard(action: ActionModel, context: dict[str, Any], console: Console)
     raise WizardPaused("Wizard paused by operator.")
 
 
-def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: dict[str, Any], console: Console) -> None:
+def run_ssh_setup_action(action: ActionModel, stage: StageModel, context: dict[str, Any], console: Console) -> None:
     host = render_template_string(action.host_template, context)
     ssh_user = render_template_string(action.ssh_user_template, context)
     public_key_path = render_template_string(action.public_key_path_template, context)
@@ -1338,7 +1337,7 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
 
     while True:
         message = render_template_string(action.message_template, context)
-        console.print(Rule(f"[bold cyan]{section.title}[/bold cyan]"))
+        console.print(Rule(f"[bold cyan]{stage.title}[/bold cyan]"))
         console.print(message.strip(), soft_wrap=True, highlight=False)
         console.print()
         console.print(
@@ -1347,7 +1346,7 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
         )
         console.print()
         if manual_requested:
-            render_manual_action_commands(section.id, commands, context, console)
+            render_manual_action_commands(stage.id, commands, context, console)
 
         choice = ask_question(
             questionary.select(
@@ -1420,14 +1419,13 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
         return
 
 
-def run_section_actions(
-    section: SectionModel,
+def run_stage_actions(
+    stage: StageModel,
     context: dict[str, Any],
-    repo_root: Path,
     assume_yes: bool,
     console: Console,
 ) -> None:
-    for action in section.actions:
+    for action in stage.actions:
         if not evaluate_condition(action.when, context):
             continue
 
@@ -1435,16 +1433,28 @@ def run_section_actions(
             continue
 
         if action.kind == "ssh_setup":
-            run_ssh_setup_action(action, section, context, console)
+            run_ssh_setup_action(action, stage, context, console)
+            continue
+
+        if action.kind == "local_command":
+            items = [None]
+            if action.collection_key:
+                items = context.get(action.collection_key, []) or []
+            for action_item in items:
+                action_context = copy.deepcopy(context)
+                action_context["action_item"] = action_item
+                if not evaluate_condition(action.when, action_context):
+                    continue
+                run_local_command_action(action, context, console, action_item)
             continue
 
         message = render_template_string(action.message_template, context)
-        console.print(Rule(f"[bold cyan]{section.title}[/bold cyan]"))
+        console.print(Rule(f"[bold cyan]{stage.title}[/bold cyan]"))
         console.print(message, soft_wrap=True, highlight=False)
 
         if action.commands_template:
             commands = render_template_string(action.commands_template, context).strip()
-            render_manual_action_commands(section.id, commands, context, console)
+            render_manual_action_commands(stage.id, commands, context, console)
 
         choice = ask_question(
             questionary.select(
@@ -1659,29 +1669,6 @@ def run_local_command_action(
         return
 
 
-def run_post_write_actions(
-    profile: ProfileModel,
-    context: dict[str, Any],
-    repo_root: Path,
-    assume_yes: bool,
-    console: Console,
-) -> None:
-    if assume_yes:
-        return
-    for action in profile.post_write_actions:
-        if action.kind != "local_command":
-            continue
-        items = [None]
-        if action.collection_key:
-            items = context.get(action.collection_key, []) or []
-        for action_item in items:
-            action_context = copy.deepcopy(context)
-            action_context["action_item"] = action_item
-            if not evaluate_condition(action.when, action_context):
-                continue
-            run_local_command_action(action, context, console, action_item)
-
-
 def render_welcome(console: Console, profile: ProfileModel, assume_yes: bool) -> None:
     mode_label = "guided" if not assume_yes else "non-interactive"
     console.print(
@@ -1697,24 +1684,16 @@ def render_welcome(console: Console, profile: ProfileModel, assume_yes: bool) ->
     )
 
 
-def render_startup_intro(console: Console) -> None:
-    console.print()
-    console.print("[bold cyan]Startup choices[/bold cyan]")
-    console.print(
-        "A few top-level preferences shape the rest of the run before the numbered steps begin.",
-        style="dim",
-    )
-
-
-def render_section_intro(console: Console, section: SectionModel, index: int) -> None:
+def render_stage_intro(console: Console, entry: dict[str, Any]) -> None:
+    stage = entry["stage"]
     body = ""
-    if section.description:
-        body = f"{section.description}\n\n"
-    body += f"[dim]Step {index}[/dim]"
+    if stage.description:
+        body = f"{stage.description}\n\n"
+    body += f"[dim]{stage_heading(entry)}[/dim]\n[dim]{stage_label(entry)}[/dim]"
     console.print(
         Panel(
             body,
-            title=f"[bold blue]{section.title}[/bold blue]",
+            title=f"[bold blue]{stage.title}[/bold blue]",
             border_style="blue",
             box=box.ROUNDED,
             padding=(0, 2),
@@ -2098,237 +2077,267 @@ def write_output_file(repo_root: Path, built: dict[str, Any], output: OutputMode
     return target_path
 
 
-def deploy_stage_command(stage_id: str, context: dict[str, Any]) -> list[str]:
-    command = [f"{context['repo_root']}/scripts/deploy.sh", "--skip-collections"]
-    if stage_id != "preflight":
-        command.append("--skip-preflight")
-    if stage_id != "bootstrap":
-        command.append("--skip-bootstrap")
-    if stage_id != "site":
-        command.append("--skip-site")
-    if stage_id != "backup":
-        command.append("--skip-backup")
-    command.extend(wizard_vault_cli_args(context))
-    return command
+def built_context_payload(
+    profile: ProfileModel,
+    builder: Any,
+    context: dict[str, Any],
+    template_root: Path,
+    repo_root: Path,
+) -> tuple[dict[str, Any], list[tuple[OutputModel, str]], bool]:
+    built = builder(context)
+    context.update(copy.deepcopy(built))
+    built["profile_id"] = context["profile_id"]
+    built["timestamp"] = context["timestamp"]
+    built["write_details"] = bool(context.get("write_details", False))
+    built["include_secret_details"] = bool(context.get("include_secret_details", False))
+    vault_was_encrypted = is_ansible_vault_file(inventory_vault_path(repo_root))
+    context["wizard_existing_vault_was_encrypted"] = vault_was_encrypted
+    rendered_outputs = render_outputs(profile, built, template_root)
+    return built, rendered_outputs, vault_was_encrypted
 
 
-def lockdown_stage_command(context: dict[str, Any], confirm: bool) -> list[str]:
-    command = [f"{context['repo_root']}/scripts/ssh-lockdown.sh"]
-    if confirm:
-        command.append("--confirm")
-    command.extend(wizard_vault_cli_args(context))
-    return command
-
-
-def runtime_stage_choices(default_label: str = "Run this stage now") -> list[str]:
-    return [
-        default_label,
-        "Skip this stage and continue",
-        "Return to configuration/review",
-        "Save progress and exit",
-        "Exit without saving progress",
-    ]
-
-
-def handle_runtime_stage_failure(context: dict[str, Any], console: Console, stage_label: str) -> str:
-    choice = ask_question(
-        questionary.select(
-            f"{stage_label} failed. What do you want to do next?",
-            choices=[
-                "Retry this stage",
-                "Return to configuration/review",
-                "Skip remaining stages",
-                "Save progress and exit",
-                "Exit without saving progress",
-            ],
-            default="Retry this stage",
-        ),
+def resolve_review_preferences(
+    answers: dict[str, Any],
+    assume_yes: bool,
+    context: dict[str, Any],
+    console: Console,
+) -> None:
+    explain_next_choice(
+        console,
+        "Optional record file",
+        "A private details file can capture setup notes and, if you choose, raw secrets for handoff or safekeeping.",
+    )
+    write_details = maybe_prompt_runtime_option(
+        answers,
+        "write_details",
+        "Write sensitive details file?",
+        False,
+        assume_yes,
         context,
         console,
     )
-    console.print()
-    if choice == "Save progress and exit":
-        save_and_exit(context, console)
-    if choice == "Exit without saving progress":
-        exit_without_saving(context, console)
-    if choice == "Skip remaining stages":
-        return "skip_remaining"
-    if choice == "Return to configuration/review":
-        return "review"
-    return "retry"
+    include_secret_details = False
+    if write_details:
+        explain_next_choice(
+            console,
+            "Raw secrets in the record file",
+            "Including raw secrets makes handoff easier, but it also creates another sensitive file to protect or delete afterward.",
+        )
+        include_secret_details = maybe_prompt_runtime_option(
+            answers,
+            "include_secret_details",
+            "Include raw secret values in the details file?",
+            False,
+            assume_yes,
+            context,
+            console,
+        )
+    explain_next_choice(
+        console,
+        "Optional audit log",
+        "The audit log records what the wizard did without storing raw secrets. It is useful for traceability and reruns.",
+    )
+    write_log = maybe_prompt_runtime_option(
+        answers,
+        "write_log",
+        "Write sanitized audit log?",
+        False,
+        assume_yes,
+        context,
+        console,
+    )
+    context["write_details"] = write_details
+    context["include_secret_details"] = include_secret_details
+    context["write_log"] = write_log
 
 
-def run_runtime_stages(
+def run_review_stage(
     profile: ProfileModel,
+    stage: StageModel,
+    builder: Any,
     context: dict[str, Any],
-    built: dict[str, Any],
-    rendered_outputs: list[tuple[OutputModel, str]],
+    answers: dict[str, Any],
+    assume_yes: bool,
+    template_root: Path,
     repo_root: Path,
     console: Console,
-) -> str:
-    vault_stage_output = next((item for item in rendered_outputs if item[0].id == "vault"), None)
-    vault_path = inventory_vault_path(repo_root)
-    stages = [
-        {
-            "id": "vault-strategy",
-            "title": "Stage 2: Vault password strategy",
-            "body": "Choose whether later stages should prompt for the vault password, reuse a local password file, or create the managed default .vault_pass file.",
-        },
-        {
-            "id": "vault-encrypt",
-            "title": "Stage 3: Encrypt or re-encrypt vault.yml",
-            "body": "Write the current vault answers, then restore Ansible Vault protection before any deployment stage runs.",
-        },
-        {
-            "id": "collections",
-            "title": "Stage 4: Install collections",
-            "body": "Install or refresh the required Ansible collections for this repo.",
-        },
-        {
-            "id": "preflight",
-            "title": "Stage 5: Preflight",
-            "body": "Validate the generated inventory, secrets wiring, and deployment contract before changing the host.",
-        },
-        {
-            "id": "bootstrap",
-            "title": "Stage 6: Bootstrap",
-            "body": "Prepare the host foundation and steady-state access path.",
-        },
-        {
-            "id": "site",
-            "title": "Stage 7: Site deploy",
-            "body": "Apply the enabled application and service configuration.",
-        },
-        {
-            "id": "backup",
-            "title": "Stage 8: Backup setup",
-            "body": "Configure the scheduled backup jobs and maintenance tasks.",
-        },
-        {
-            "id": "ssh-lockdown",
-            "title": "Stage 9: Optional SSH lockdown",
-            "body": "Optionally run the staged SSH lockdown after you have confirmed your restrictive access path.",
-        },
-    ]
-    stage_index = int(context.get("wizard_runtime_stage_index", 0))
-    while stage_index < len(stages):
-        stage = stages[stage_index]
-        console.print(Rule(f"[bold cyan]{stage['title']}[/bold cyan]"))
-        console.print(stage["body"], style="dim")
-        console.print()
-        action = ask_question(
+) -> bool:
+    resolve_review_preferences(answers, assume_yes, context, console)
+    built, rendered_outputs, vault_was_encrypted = built_context_payload(profile, builder, context, template_root, repo_root)
+    render_review_summary(console, built, rendered_outputs, repo_root)
+
+    if not assume_yes:
+        choice = ask_question(
             questionary.select(
-                "What do you want to do?",
-                choices=runtime_stage_choices(),
-                default="Run this stage now",
+                stage.confirmation_prompt or "Review complete. What do you want to do next?",
+                choices=[
+                    "Write files and continue",
+                    "Return to stage menu",
+                    "Save and exit",
+                    "Exit without saving progress",
+                ],
+                default="Write files and continue",
             ),
             context,
             console,
         )
         console.print()
-        if action == "Skip this stage and continue":
-            stage_index += 1
-            context["wizard_runtime_stage_index"] = stage_index
-            persist_progress(context, len(profile.sections))
-            continue
-        if action == "Return to configuration/review":
-            return "review"
-        if action == "Save progress and exit":
+        if choice == "Return to stage menu":
+            return False
+        if choice == "Save and exit":
             save_and_exit(context, console)
-        if action == "Exit without saving progress":
+        if choice == "Exit without saving progress":
             exit_without_saving(context, console)
 
-        try:
-            if stage["id"] == "vault-strategy":
-                configure_vault_password_strategy(repo_root, context, console)
-            elif stage["id"] == "vault-encrypt":
-                if vault_stage_output is None:
-                    console.print("[yellow]No vault output is defined for this profile.[/yellow]")
-                else:
-                    output, content = vault_stage_output
-                    if context.get("wizard_existing_vault_was_encrypted"):
-                        replace_existing = ask_question(
-                            questionary.select(
-                                "vault.yml was already encrypted before this run. What do you want to do?",
-                                choices=[
-                                    "Replace the existing vault with the regenerated values",
-                                    "Keep the existing encrypted vault and continue",
-                                    "Return to the stage menu",
-                                ],
-                                default="Replace the existing vault with the regenerated values",
-                            ),
-                            context,
-                            console,
-                        )
-                        console.print()
-                        if replace_existing == "Return to the stage menu":
-                            continue
-                        if replace_existing == "Keep the existing encrypted vault and continue":
-                            stage_index += 1
-                            context["wizard_runtime_stage_index"] = stage_index
-                            persist_progress(context, len(profile.sections))
-                            continue
-                    write_output_file(repo_root, built, output, content, console)
-                    encrypted_vault_password_file = finalize_vault_password_file(
-                        repo_root,
-                        context.get("vault_password_file"),
-                        False,
-                        context,
-                        console,
-                        needs_prompt=True,
-                        requires_noninteractive_value=False,
-                    )
-                    if encrypted_vault_password_file is not None:
-                        context["vault_password_file"] = str(encrypted_vault_password_file)
-                        context["vault_password_prompt_mode"] = "file"
-                    elif not context.get("vault_password_prompt_mode"):
-                        context["vault_password_prompt_mode"] = "ask"
-                    encrypt_vault_file(repo_root, encrypted_vault_password_file, console)
-            elif stage["id"] == "collections":
-                run_shell_command([f"{context['repo_root']}/scripts/install-collections.sh"], repo_root, console)
-            elif stage["id"] in {"preflight", "bootstrap", "site", "backup"}:
-                run_shell_command(deploy_stage_command(stage["id"], context), repo_root, console)
-            elif stage["id"] == "ssh-lockdown":
-                lockdown_choice = ask_question(
-                    questionary.select(
-                        "Which SSH lockdown path do you want to run?",
-                        choices=[
-                            "Validation-only checks",
-                            "Restrictive SSH lockdown (--confirm)",
-                            "Return to the stage menu",
-                        ],
-                        default="Validation-only checks",
-                    ),
-                    context,
-                    console,
-                )
-                console.print()
-                if lockdown_choice == "Return to the stage menu":
-                    continue
-                run_shell_command(
-                    lockdown_stage_command(context, confirm=lockdown_choice == "Restrictive SSH lockdown (--confirm)"),
-                    repo_root,
-                    console,
-                )
-        except (subprocess.CalledProcessError, WizardError) as exc:
-            if isinstance(exc, subprocess.CalledProcessError):
-                console.print(f"[red]Stage failed with exit code {exc.returncode}.[/red]")
-            else:
-                console.print(f"[red]{exc}[/red]")
-            next_step = handle_runtime_stage_failure(context, console, stage["title"])
-            if next_step == "review":
-                return "review"
-            if next_step == "skip_remaining":
-                context["wizard_runtime_stage_index"] = len(stages)
-                persist_progress(context, len(profile.sections))
-                return "complete"
+    for output, content in rendered_outputs:
+        if output.id == "vault" and vault_was_encrypted:
             continue
+        write_output_file(repo_root, built, output, content, console)
 
-        stage_index += 1
-        context["wizard_runtime_stage_index"] = stage_index
-        persist_progress(context, len(profile.sections))
+    if vault_was_encrypted and any(output.id == "vault" for output, _ in rendered_outputs):
+        console.print(
+            "[yellow]Kept the existing encrypted vault.yml in place for now. The Vault stage will let you replace it with regenerated values or keep the existing encrypted file.[/yellow]"
+        )
 
-    return "complete"
+    if context.get("write_log"):
+        log_path = write_audit_log(repo_root, built)
+        context["wizard_audit_log_path"] = str(log_path)
+        console.print(f"[green]Wrote[/green] {display_path(log_path, repo_root)}")
+
+    context["wizard_outputs_written"] = True
+    context["wizard_written_generation"] = int(context.get("wizard_written_generation", 0)) + 1
+    return True
+
+
+def run_vault_stage(
+    profile: ProfileModel,
+    builder: Any,
+    context: dict[str, Any],
+    template_root: Path,
+    repo_root: Path,
+    console: Console,
+) -> bool:
+    configure_vault_password_strategy(repo_root, context, console)
+    built, rendered_outputs, _vault_was_encrypted = built_context_payload(profile, builder, context, template_root, repo_root)
+    vault_stage_output = next((item for item in rendered_outputs if item[0].id == "vault"), None)
+    if vault_stage_output is None:
+        console.print("[yellow]No vault output is defined for this profile.[/yellow]")
+        return True
+
+    output, content = vault_stage_output
+    if context.get("wizard_existing_vault_was_encrypted"):
+        replace_existing = ask_question(
+            questionary.select(
+                "vault.yml was already encrypted before this run. What do you want to do?",
+                choices=[
+                    "Replace the existing vault with regenerated values",
+                    "Keep the existing encrypted vault and continue",
+                    "Return to stage menu",
+                ],
+                default="Replace the existing vault with regenerated values",
+            ),
+            context,
+            console,
+        )
+        console.print()
+        if replace_existing == "Return to stage menu":
+            return False
+        if replace_existing == "Keep the existing encrypted vault and continue":
+            return True
+
+    write_output_file(repo_root, built, output, content, console)
+    encrypted_vault_password_file = finalize_vault_password_file(
+        repo_root,
+        context.get("vault_password_file"),
+        False,
+        context,
+        console,
+        needs_prompt=True,
+        requires_noninteractive_value=False,
+    )
+    if encrypted_vault_password_file is not None:
+        context["vault_password_file"] = str(encrypted_vault_password_file)
+        context["vault_password_prompt_mode"] = "file"
+    elif not context.get("vault_password_prompt_mode"):
+        context["vault_password_prompt_mode"] = "ask"
+    encrypt_vault_file(repo_root, encrypted_vault_password_file, console)
+    return True
+
+
+def render_manual_checklist(stage: StageModel, console: Console) -> None:
+    if not stage.checklist:
+        return
+    console.print("[cyan]Checklist[/cyan]")
+    for item in stage.checklist:
+        console.print(f"- {item}", highlight=False)
+    console.print()
+
+
+def execute_stage(
+    profile: ProfileModel,
+    entry: dict[str, Any],
+    builder: Any,
+    context: dict[str, Any],
+    answers: dict[str, Any],
+    assume_yes: bool,
+    template_root: Path,
+    repo_root: Path,
+    console: Console,
+    answered_fields: set[str],
+    answered_collections: set[str],
+) -> bool:
+    stage = entry["stage"]
+    set_stage_state(context, stage.id, "in_progress")
+    set_stage_cursor(context, stage.id, 0)
+
+    if stage.kind in {"form_stage", "repeatable_stage"}:
+        if stage.fields:
+            collect_fields(stage, context, answers, assume_yes, console, repo_root, answered_fields)
+            set_stage_cursor(context, stage.id, len(stage.fields))
+        for repeatable in stage.repeatables:
+            if not evaluate_condition(repeatable.when, context):
+                continue
+            collect_repeatable(repeatable, context, answers, assume_yes, console, repo_root, answered_collections)
+            set_stage_cursor(context, stage.id, int(context["wizard_stage_step_cursor"][stage.id]) + 1)
+        run_stage_actions(stage, context, assume_yes, console)
+        context["wizard_outputs_written"] = False
+    elif stage.kind == "review_stage":
+        if not run_review_stage(profile, stage, builder, context, answers, assume_yes, template_root, repo_root, console):
+            return False
+        set_stage_cursor(context, stage.id, 1)
+    elif stage.steps_source == "vault":
+        if not run_vault_stage(profile, builder, context, template_root, repo_root, console):
+            return False
+        set_stage_cursor(context, stage.id, 1)
+    else:
+        render_manual_checklist(stage, console)
+        run_stage_actions(stage, context, assume_yes, console)
+        if stage.kind == "manual_stage" and not assume_yes:
+            confirm_choice = ask_question(
+                questionary.select(
+                    stage.confirmation_prompt or "When you are satisfied, what do you want to do?",
+                    choices=[
+                        "Mark stage complete",
+                        "Return to stage menu",
+                        "Save and exit",
+                        "Exit without saving progress",
+                    ],
+                    default="Mark stage complete",
+                ),
+                context,
+                console,
+            )
+            console.print()
+            if confirm_choice == "Return to stage menu":
+                return False
+            if confirm_choice == "Save and exit":
+                save_and_exit(context, console)
+            if confirm_choice == "Exit without saving progress":
+                exit_without_saving(context, console)
+        set_stage_cursor(context, stage.id, 1)
+
+    set_stage_state(context, stage.id, "completed")
+    return True
 
 
 def maybe_prompt_option(
@@ -2409,6 +2418,39 @@ def choose_startup_answers_path(
     return None, False
 
 
+def review_boundary_index(entries: list[dict[str, Any]]) -> int:
+    for index, entry in enumerate(entries):
+        if entry["stage"].kind == "review_stage":
+            return index
+    return -1
+
+
+def handle_stage_failure(stage: StageModel, context: dict[str, Any], console: Console) -> str:
+    choices = ["Retry stage"]
+    if stage.allow_skip:
+        choices.append("Skip stage")
+    choices.extend(["Return to stage", "Save and exit", "Exit without saving progress"])
+    choice = ask_question(
+        questionary.select(
+            f"{stage.title} failed. What do you want to do next?",
+            choices=choices,
+            default="Retry stage",
+        ),
+        context,
+        console,
+    )
+    console.print()
+    if choice == "Save and exit":
+        save_and_exit(context, console)
+    if choice == "Exit without saving progress":
+        exit_without_saving(context, console)
+    if choice == "Return to stage":
+        return "return"
+    if choice == "Skip stage":
+        return "skip"
+    return "retry"
+
+
 def run_wizard(
     profile_path: Path,
     repo_root: Path,
@@ -2452,10 +2494,10 @@ def run_wizard(
         context["vault_password_prompt_mode"] = "file"
     if "wizard_last_interrupt_at" not in context:
         context["wizard_last_interrupt_at"] = 0.0
-    if "wizard_resume_section_index" not in context:
-        context["wizard_resume_section_index"] = 0
-    if "wizard_furthest_resume_index" not in context:
-        context["wizard_furthest_resume_index"] = int(context["wizard_resume_section_index"])
+    context.setdefault("wizard_stage_states", {})
+    context.setdefault("wizard_stage_step_cursor", {})
+    context.setdefault("wizard_outputs_written", False)
+    context.setdefault("wizard_written_generation", 0)
     if assume_yes:
         context["wizard_resume_enabled"] = bool(context.get("wizard_resume_enabled", False))
     elif is_resume_state:
@@ -2465,7 +2507,7 @@ def run_wizard(
         explain_next_choice(
             console,
             "Resumable run",
-            "The wizard can save progress after each section so you can safely pause, recover from interrupts, or pick up later without retyping everything.",
+            "The wizard can save progress after each stage so you can safely pause, recover from interrupts, or pick up later without retyping everything.",
         )
         context["wizard_resume_enabled"] = bool(
             ask_question(
@@ -2479,208 +2521,168 @@ def run_wizard(
     answered_collections: set[str] = set()
 
     render_welcome(console, profile, assume_yes)
-    resume_section_index = int(context.get("wizard_resume_section_index", 0))
-    skip_startup = is_resume_state and resume_section_index >= len(profile.sections)
-    if profile.startup_fields and not skip_startup:
-        render_startup_intro(console)
-        startup_section = SectionModel(id="startup", title="Startup", fields=profile.startup_fields)
-        collect_fields(startup_section, context, provided_answers, assume_yes, console, repo_root, answered_fields)
-        persist_progress(context, 0)
+    entries = initialize_workflow_context(profile, context)
 
-    section_index = int(context.get("wizard_resume_section_index", 0))
-    if is_resume_state and not assume_yes and furthest_resume_index(context) <= len(profile.sections):
-        section_index = choose_resume_section(profile, context, furthest_resume_index(context), console)
+    if assume_yes:
+        for entry in entries:
+            set_current_stage(context, entry)
+            if entry["stage"].kind in {"command_stage", "manual_stage"}:
+                break
+            if not execute_stage(
+                profile,
+                entry,
+                builder,
+                context,
+                provided_answers,
+                assume_yes,
+                template_root,
+                repo_root,
+                console,
+                answered_fields,
+                answered_collections,
+            ):
+                break
+            persist_progress(context)
+
+        cleanup_generated_resume_state(selected_answers_path, context, console)
+        console.print(
+            Panel(
+                "[bold green]Configuration written.[/bold green]\n"
+                "[dim]Run the interactive workflow later if you want the wizard to execute preparation and deployment stages.[/dim]",
+                border_style="green",
+                box=box.ROUNDED,
+                padding=(1, 2),
+            )
+        )
+        if context.get("write_details"):
+            console.print("[yellow]Sensitive details file written. Store it carefully or delete it after handoff.[/yellow]")
+        if context.get("write_log"):
+            console.print("[cyan]Sanitized audit log written.[/cyan]")
+        return
+
     while True:
-        resumed_directly_to_stages = bool(context.get("wizard_outputs_written")) and section_index >= len(profile.sections)
-        sections_revisited = False
-        while section_index < len(profile.sections):
-            sections_revisited = True
-            context["wizard_current_section_index"] = section_index
-            context["wizard_resume_section_index"] = section_index
-            section = profile.sections[section_index]
-            if not evaluate_condition(section.when, context):
-                section_index += 1
+        entries = initialize_workflow_context(profile, context)
+        if not entries:
+            break
+        index = current_stage_index(entries, context)
+        entry = entries[index]
+        stage = entry["stage"]
+        set_current_stage(context, entry)
+
+        render_stage_intro(console, entry)
+        console.print(f"[dim]Current state: {stage_state(context, stage.id).replace('_', ' ')}[/dim]")
+        console.print()
+
+        action = ask_question(
+            questionary.select(
+                "What do you want to do?",
+                choices=stage_menu_choices(stage),
+                default=stage_menu_choices(stage)[0],
+            ),
+            context,
+            console,
+        )
+        console.print()
+
+        if action == "Return to stage":
+            target = choose_return_stage(profile, context, console, index)
+            if target is None:
                 continue
-
-            step_index = sum(1 for item in profile.sections[: section_index + 1] if evaluate_condition(item.when, context))
-            render_section_intro(console, section, step_index)
-            if section.kind == "fields":
-                collect_fields(section, context, provided_answers, assume_yes, console, repo_root, answered_fields)
-            else:
-                collect_repeatable(
-                    section,
-                    context,
-                    provided_answers,
-                    assume_yes,
-                    console,
-                    repo_root,
-                    answered_collections,
-                )
-            run_section_actions(section, context, repo_root, assume_yes, console)
-
-            context["wizard_outputs_written"] = False
-            context["wizard_runtime_stage_index"] = 0
-            persist_progress(context, section_index + 1)
-
-            if assume_yes:
-                section_index += 1
-                continue
-
-            nav_choices = next_navigation_choices(profile, context, section_index)
-            console.print(
-                "Continue moves forward from here. Review reopens an earlier step with your current answers prefilled.",
-                style="dim",
+            target_index = next(
+                candidate_index
+                for candidate_index, candidate in enumerate(entries)
+                if candidate["stage"].id == target["stage"].id
             )
-            console.print()
-            navigation = ask_question(
-                questionary.select(
-                    "What do you want to do next?",
-                    choices=nav_choices,
-                    default=nav_choices[0],
-                ),
-                context,
-                console,
-            )
-            console.print()
-            if navigation == "Review a step":
-                resume_index = furthest_resume_index(context)
-                previous_index = choose_completed_section(profile, context, resume_index - 1, resume_index, console)
-                if previous_index is not None:
-                    section_index = previous_index
-                    continue
-            if navigation == "Save progress and exit":
-                save_and_exit(context, console)
-            if navigation == "Exit without saving progress":
-                exit_without_saving(context, console)
-            if navigation.startswith("Resume at "):
-                section_index = furthest_resume_index(context)
-                continue
-            section_index += 1
-
-        outputs_already_written = resumed_directly_to_stages and not sections_revisited
-        log_path = None
-        if outputs_already_written:
-            write_details = bool(context.get("write_details", False))
-            include_secret_details = bool(context.get("include_secret_details", False))
-            write_log = bool(context.get("write_log", False))
-        else:
-            explain_next_choice(
-                console,
-                "Optional record file",
-                "A private details file can capture setup notes and, if you choose, raw secrets for handoff or safekeeping.",
-            )
-            write_details = maybe_prompt_runtime_option(
-                provided_answers,
-                "write_details",
-                "Write sensitive details file?",
-                False,
-                assume_yes,
-                context,
-                console,
-            )
-            include_secret_details = False
-            if write_details:
-                explain_next_choice(
-                    console,
-                    "Raw secrets in the record file",
-                    "Including raw secrets makes handoff easier, but it also creates another sensitive file to protect or delete afterward.",
-                )
-                include_secret_details = maybe_prompt_runtime_option(
-                    provided_answers,
-                    "include_secret_details",
-                    "Include raw secret values in the details file?",
-                    False,
-                    assume_yes,
-                    context,
-                    console,
-                )
-            explain_next_choice(
-                console,
-                "Optional audit log",
-                "The audit log records what the wizard did without storing raw secrets. It is useful for traceability and reruns.",
-            )
-            write_log = maybe_prompt_runtime_option(
-                provided_answers,
-                "write_log",
-                "Write sanitized audit log?",
-                False,
-                assume_yes,
-                context,
-                console,
-            )
-            context["write_details"] = write_details
-            context["include_secret_details"] = include_secret_details
-            context["write_log"] = write_log
-
-        built = builder(context)
-        built["profile_id"] = context["profile_id"]
-        built["timestamp"] = context["timestamp"]
-        built["write_details"] = write_details
-        built["include_secret_details"] = include_secret_details
-
-        vault_was_encrypted = is_ansible_vault_file(inventory_vault_path(repo_root))
-        context["wizard_existing_vault_was_encrypted"] = vault_was_encrypted
-        rendered_outputs = render_outputs(profile, built, template_root)
-
-        if not outputs_already_written:
-            render_review_summary(console, built, rendered_outputs, repo_root)
-            for output, content in rendered_outputs:
-                if output.id == "vault" and vault_was_encrypted:
-                    continue
-                write_output_file(repo_root, built, output, content, console)
-            if vault_was_encrypted and any(output.id == "vault" for output, _ in rendered_outputs):
-                console.print(
-                    "[yellow]Kept the existing encrypted vault.yml in place for now. The runtime vault stage will let you replace it with the regenerated values or keep the existing encrypted file.[/yellow]"
-                )
-
-            if write_log:
-                log_path = write_audit_log(repo_root, built)
-                console.print(f"[green]Wrote[/green] {display_path(log_path, repo_root)}")
-
-            context["wizard_outputs_written"] = True
-            context["wizard_resume_section_index"] = len(profile.sections)
-            context["wizard_runtime_stage_index"] = 0
-            persist_progress(context, len(profile.sections))
-
-        if assume_yes:
-            cleanup_generated_resume_state(selected_answers_path, built, console)
-            console.print(
-                Panel(
-                    "[bold green]Setup files written.[/bold green]\n"
-                    "[dim]Resume with interactive stages later if you want the wizard to run deployment steps.[/dim]",
-                    border_style="green",
-                    box=box.ROUNDED,
-                    padding=(1, 2),
-                )
-            )
-            if write_details:
-                console.print("[yellow]Sensitive details file written. Store it carefully or delete it after handoff.[/yellow]")
-            if log_path:
-                console.print("[cyan]Sanitized audit log written.[/cyan]")
-            return
-
-        runtime_result = run_runtime_stages(profile, context, built, rendered_outputs, repo_root, console)
-        if runtime_result == "review":
-            resume_index = furthest_resume_index(context)
-            previous_index = choose_completed_section(profile, context, len(profile.sections) - 1, resume_index, console)
-            context["wizard_outputs_written"] = False
-            context["wizard_runtime_stage_index"] = 0
-            section_index = previous_index if previous_index is not None else 0
+            reset_following_stage_state(context, entries, target_index + 1)
+            if review_boundary_index(entries) >= 0 and target_index <= review_boundary_index(entries):
+                context["wizard_outputs_written"] = False
+            set_current_stage(context, target)
+            persist_progress(context)
             continue
-        break
 
-    cleanup_generated_resume_state(selected_answers_path, built, console)
+        if action == "Save and exit":
+            save_and_exit(context, console)
+        if action == "Exit without saving progress":
+            exit_without_saving(context, console)
+        if action == "Skip stage":
+            set_stage_state(context, stage.id, "skipped")
+            if index + 1 < len(entries):
+                set_current_stage(context, entries[index + 1])
+            persist_progress(context)
+            continue
+
+        try:
+            completed = execute_stage(
+                profile,
+                entry,
+                builder,
+                context,
+                provided_answers,
+                False,
+                template_root,
+                repo_root,
+                console,
+                answered_fields,
+                answered_collections,
+            )
+        except (subprocess.CalledProcessError, WizardError) as exc:
+            if isinstance(exc, subprocess.CalledProcessError):
+                console.print(f"[red]Stage failed with exit code {exc.returncode}.[/red]")
+            else:
+                console.print(f"[red]{exc}[/red]")
+            next_step = handle_stage_failure(stage, context, console)
+            if next_step == "skip":
+                set_stage_state(context, stage.id, "skipped")
+                if index + 1 < len(entries):
+                    set_current_stage(context, entries[index + 1])
+                persist_progress(context)
+                continue
+            if next_step == "return":
+                target = choose_return_stage(profile, context, console, index)
+                if target is not None:
+                    target_index = next(
+                        candidate_index
+                        for candidate_index, candidate in enumerate(entries)
+                        if candidate["stage"].id == target["stage"].id
+                    )
+                    reset_following_stage_state(context, entries, target_index + 1)
+                    if review_boundary_index(entries) >= 0 and target_index <= review_boundary_index(entries):
+                        context["wizard_outputs_written"] = False
+                    set_current_stage(context, target)
+                    persist_progress(context)
+                continue
+            continue
+
+        if not completed:
+            persist_progress(context)
+            continue
+
+        entries = initialize_workflow_context(profile, context)
+        current_id = stage.id
+        next_index = 0
+        for candidate_index, candidate in enumerate(entries):
+            if candidate["stage"].id == current_id:
+                next_index = candidate_index + 1
+                break
+        if next_index < len(entries):
+            set_current_stage(context, entries[next_index])
+        persist_progress(context)
+
+        if next_index >= len(entries):
+            break
+
+    cleanup_generated_resume_state(selected_answers_path, context, console)
 
     console.print(
         Panel(
-            "[bold green]Setup complete.[/bold green]\n"
-            "[dim]Configuration, vault handling, and the selected execution stages are finished.[/dim]",
+            "[bold green]Workflow complete.[/bold green]\n"
+            "[dim]The configured stages for this run are finished.[/dim]",
             border_style="green",
             box=box.ROUNDED,
             padding=(1, 2),
         )
     )
-    if write_details:
+    if context.get("write_details"):
         console.print("[yellow]Sensitive details file written. Store it carefully or delete it after handoff.[/yellow]")
     if context.get("write_log"):
         console.print("[cyan]Sanitized audit log written.[/cyan]")

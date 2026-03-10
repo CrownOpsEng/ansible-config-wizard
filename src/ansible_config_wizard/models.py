@@ -27,20 +27,6 @@ class FieldModel(BaseModel):
     source: SourceModel = Field(default_factory=SourceModel)
 
 
-class SectionModel(BaseModel):
-    id: str
-    title: str
-    description: str | None = None
-    kind: Literal["fields", "repeatable"] = "fields"
-    when: str | None = None
-    fields: list[FieldModel] = Field(default_factory=list)
-    collection_key: str | None = None
-    item_label: str = "item"
-    default_count: int = 0
-    min_items: int = 0
-    actions: list["ActionModel"] = Field(default_factory=list)
-
-
 class LocalCommandOptionModel(BaseModel):
     id: str
     label: str
@@ -87,6 +73,43 @@ class ActionModel(BaseModel):
         return self
 
 
+class RepeatableModel(BaseModel):
+    id: str
+    title: str
+    description: str | None = None
+    when: str | None = None
+    collection_key: str | None = None
+    item_label: str = "item"
+    default_count: int = 0
+    min_items: int = 0
+    fields: list[FieldModel] = Field(default_factory=list)
+    actions: list[ActionModel] = Field(default_factory=list)
+
+
+class StageModel(BaseModel):
+    id: str
+    title: str
+    description: str | None = None
+    kind: Literal["form_stage", "repeatable_stage", "review_stage", "command_stage", "manual_stage"]
+    when: str | None = None
+    allow_skip: bool = False
+    steps_source: str | None = None
+    dependencies: list[str] = Field(default_factory=list)
+    fields: list[FieldModel] = Field(default_factory=list)
+    repeatables: list[RepeatableModel] = Field(default_factory=list)
+    actions: list[ActionModel] = Field(default_factory=list)
+    checklist: list[str] = Field(default_factory=list)
+    confirmation_prompt: str | None = None
+
+
+class PhaseModel(BaseModel):
+    id: str
+    title: str
+    description: str | None = None
+    when: str | None = None
+    stages: list[StageModel] = Field(default_factory=list)
+
+
 class OutputModel(BaseModel):
     id: str
     path: str
@@ -100,7 +123,5 @@ class ProfileModel(BaseModel):
     name: str
     builder: str | None = None
     defaults: dict[str, Any] = Field(default_factory=dict)
-    startup_fields: list[FieldModel] = Field(default_factory=list)
-    sections: list[SectionModel]
-    post_write_actions: list[ActionModel] = Field(default_factory=list)
-    outputs: list[OutputModel]
+    phases: list[PhaseModel] = Field(default_factory=list)
+    outputs: list[OutputModel] = Field(default_factory=list)

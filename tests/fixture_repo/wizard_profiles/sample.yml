@@ -3,46 +3,60 @@ name: Sample Wizard Profile
 builder: wizard_support.builders:build_sample_context
 defaults:
   ansible_user: deploy
-sections:
-  - id: basics
-    title: Basics
-    fields:
-      - id: host_name
-        label: Host name
-        required: true
-      - id: ansible_host
-        label: Ansible host
-        required: true
-      - id: ansible_user
-        label: Ansible user
-        default: deploy
-      - id: base_domain
-        label: Base domain
-        required: true
-      - id: vault_demo_password
-        label: Demo password
-        secret: true
-        source:
-          kind: generate
-          generator: password
-          params:
-            length: 24
-      - id: bootstrap_key
-        label: Bootstrap key
-        type: ssh_keypair
-        source:
-          kind: generate
-          generator: ed25519_keypair
-          params:
-            path_template: "{{ wizard_ssh_dir }}/{{ host_name }}"
-            comment_template: "{{ ansible_user }}@{{ host_name }}"
-            reuse_existing: true
-    actions:
-      - kind: pause
-        save_state: true
-        message_template: |
-          Pause point for {{ host_name }}.
-        prompt: Continue after completing this step?
+phases:
+  - id: configure
+    title: Configure
+    stages:
+      - id: basics
+        title: Basics
+        kind: form_stage
+        fields:
+          - id: host_name
+            label: Host name
+            required: true
+          - id: ansible_host
+            label: Ansible host
+            required: true
+          - id: ansible_user
+            label: Ansible user
+            default: deploy
+          - id: base_domain
+            label: Base domain
+            required: true
+          - id: vault_demo_password
+            label: Demo password
+            secret: true
+            source:
+              kind: generate
+              generator: password
+              params:
+                length: 24
+          - id: bootstrap_key
+            label: Bootstrap key
+            type: ssh_keypair
+            source:
+              kind: generate
+              generator: ed25519_keypair
+              params:
+                path_template: "{{ wizard_ssh_dir }}/{{ host_name }}"
+                comment_template: "{{ ansible_user }}@{{ host_name }}"
+                reuse_existing: true
+        actions:
+          - kind: pause
+            save_state: true
+            message_template: |
+              Pause point for {{ host_name }}.
+            prompt: Continue after completing this step?
+      - id: review
+        title: Review
+        kind: review_stage
+  - id: prepare
+    title: Prepare
+    stages:
+      - id: vault
+        title: Vault
+        kind: command_stage
+        steps_source: vault
 outputs:
   - id: hosts
     path: inventories/prod/hosts.yml
