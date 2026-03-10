@@ -41,12 +41,22 @@ class SectionModel(BaseModel):
     actions: list["ActionModel"] = Field(default_factory=list)
 
 
+class LocalCommandOptionModel(BaseModel):
+    id: str
+    label: str
+    command_template: str
+    description: str | None = None
+    when: str | None = None
+    working_directory_template: str | None = None
+
+
 class ActionModel(BaseModel):
     kind: Literal["pause", "ssh_setup", "local_command"] = "pause"
     when: str | None = None
     message_template: str
     commands_template: str | None = None
     command_template: str | None = None
+    command_options: list[LocalCommandOptionModel] = Field(default_factory=list)
     prompt: str = "Continue after completing this step?"
     available_choices: list[Literal["show", "run", "leave"]] = Field(
         default_factory=lambda: ["show", "run", "leave"]
@@ -63,8 +73,13 @@ class ActionModel(BaseModel):
 
     @model_validator(mode="after")
     def validate_action(self) -> "ActionModel":
-        if self.kind == "local_command" and not self.command_template:
-            raise ValueError("local_command actions require command_template")
+        if self.kind == "local_command":
+            has_single_command = bool(self.command_template)
+            has_command_options = bool(self.command_options)
+            if has_single_command == has_command_options:
+                raise ValueError(
+                    "local_command actions require exactly one of command_template or command_options"
+                )
         if not self.available_choices:
             raise ValueError("available_choices must not be empty")
         if self.default_choice not in self.available_choices:

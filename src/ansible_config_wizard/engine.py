@@ -1431,6 +1431,88 @@ def local_command_choice_default(action: ActionModel) -> str:
     return LOCAL_COMMAND_LABELS[action.default_choice]
 
 
+def resolve_local_command_options(
+    action: ActionModel,
+    action_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    resolved: list[dict[str, Any]] = []
+    if action.command_options:
+        for option in action.command_options:
+            if not evaluate_condition(option.when, action_context):
+                continue
+            command = render_template_string(option.command_template, action_context).strip()
+            if not command:
+                continue
+            working_directory_template = option.working_directory_template or action.working_directory_template
+            working_directory = None
+            if working_directory_template:
+                working_directory = Path(render_template_string(working_directory_template, action_context))
+            resolved.append(
+                {
+                    "id": option.id,
+                    "label": option.label,
+                    "description": option.description,
+                    "command": command,
+                    "working_directory": working_directory,
+                }
+            )
+        return resolved
+
+    command = render_template_string(action.command_template, action_context).strip() if action.command_template else ""
+    if not command:
+        return []
+    working_directory = None
+    if action.working_directory_template:
+        working_directory = Path(render_template_string(action.working_directory_template, action_context))
+    resolved.append(
+        {
+            "id": "default",
+            "label": "Run now",
+            "description": None,
+            "command": command,
+            "working_directory": working_directory,
+        }
+    )
+    return resolved
+
+
+def render_local_command_manual(options: list[dict[str, Any]]) -> str:
+    if len(options) == 1:
+        return options[0]["command"]
+    sections = []
+    for option in options:
+        sections.append(f"# {option['label']}\n{option['command']}")
+    return "\n\n".join(sections)
+
+
+def choose_local_command_option(
+    options: list[dict[str, Any]],
+    context: dict[str, Any],
+    console: Console,
+) -> dict[str, Any]:
+    if len(options) == 1:
+        return options[0]
+
+    console.print("[cyan]Available follow-up actions[/cyan]")
+    for option in options:
+        line = f"- {option['label']}"
+        if option["description"]:
+            line += f": {option['description']}"
+        console.print(line, highlight=False)
+    console.print()
+
+    selected_label = ask_question(
+        questionary.select(
+            "Which follow-up action should run now?",
+            choices=[option["label"] for option in options],
+            default=options[0]["label"],
+        ),
+        context,
+        console,
+    )
+    return next(option for option in options if option["label"] == selected_label)
+
+
 def run_local_command_action(
     action: ActionModel,
     context: dict[str, Any],
@@ -1443,10 +1525,10 @@ def run_local_command_action(
     if isinstance(action_item, dict) and action_item.get("name"):
         action_name = f"{action_name}-{action_item['name']}"
     message = render_template_string(action.message_template, action_context).strip()
-    command = render_template_string(action.command_template, action_context).strip() if action.command_template else ""
-    working_directory = None
-    if action.working_directory_template:
-        working_directory = Path(render_template_string(action.working_directory_template, action_context))
+    options = resolve_local_command_options(action, action_context)
+    if not options:
+        return
+    manual_commands = render_local_command_manual(options)
     command_path: Path | None = None
 
     show_manual = False
@@ -1457,18 +1539,16 @@ def run_local_command_action(
         if command_path is not None:
             console.print(f"[cyan]Prepared command file[/cyan] {command_path}")
             console.print()
-        console.print(
-            "The wizard has prepared the next-step command. You can inspect it now, run it immediately, or leave it for later.",
-            style="dim",
-        )
-        if show_manual and command:
+        summary = "The wizard has prepared next-step command options." if len(options) > 1 else "The wizard has prepared the next-step command."
+        console.print(f"{summary} You can inspect it now, run it immediately, or leave it for later.", style="dim")
+        if show_manual and manual_commands:
             if action.write_command_file and command_path is None:
-                command_path = write_command_file(action_name, command, action_context)
+                command_path = write_command_file(action_name, manual_commands, action_context)
                 console.print()
                 console.print(f"[cyan]Prepared command file[/cyan] {command_path}")
             console.print()
-            console.print("[cyan]Follow-up command[/cyan]")
-            console.print(command, markup=False, highlight=False, no_wrap=True, overflow="ignore")
+            console.print("[cyan]Follow-up command[/cyan]" if len(options) == 1 else "[cyan]Follow-up commands[/cyan]")
+            console.print(manual_commands, markup=False, highlight=False, no_wrap=True, overflow="ignore")
             console.print()
 
         choice = ask_question(
@@ -1486,8 +1566,9 @@ def run_local_command_action(
             continue
         if choice == "Leave for later":
             return
+        selected = choose_local_command_option(options, context, console)
         try:
-            run_local_command(command, working_directory, console)
+            run_local_command(selected["command"], selected["working_directory"], console)
         except subprocess.CalledProcessError as exc:
             console.print(f"[red]Command failed with exit code {exc.returncode}.[/red]")
             show_manual = True

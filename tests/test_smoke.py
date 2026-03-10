@@ -29,9 +29,10 @@ from ansible_config_wizard.engine import (
     persist_progress,
     previous_visible_section_index,
     resolve_field,
+    resolve_local_command_options,
     run_wizard,
 )
-from ansible_config_wizard.models import ActionModel, FieldModel, SectionModel
+from ansible_config_wizard.models import ActionModel, FieldModel, LocalCommandOptionModel, SectionModel
 
 
 class Buffer:
@@ -101,7 +102,7 @@ def test_evaluate_condition_supports_attribute_access_for_dicts() -> None:
 
 
 def test_local_command_action_requires_command_template() -> None:
-    with pytest.raises(ValueError, match="command_template"):
+    with pytest.raises(ValueError, match="exactly one of command_template or command_options"):
         ActionModel(kind="local_command", message_template="Hello")
 
 
@@ -137,6 +138,36 @@ def test_local_command_actions_do_not_write_command_files_by_default() -> None:
     )
 
     assert action.write_command_file is False
+
+
+def test_local_command_action_accepts_profile_defined_command_options() -> None:
+    action = ActionModel(
+        kind="local_command",
+        message_template="Hello",
+        command_options=[
+            LocalCommandOptionModel(id="deploy", label="Run deployment", command_template="./scripts/deploy.sh"),
+            LocalCommandOptionModel(
+                id="prep",
+                label="Set up prerequisites",
+                command_template="./scripts/setup-prerequisites.sh",
+                when="needs_prereqs",
+            ),
+        ],
+    )
+
+    options = resolve_local_command_options(action, {"needs_prereqs": True})
+
+    assert [option["id"] for option in options] == ["deploy", "prep"]
+
+
+def test_local_command_action_rejects_mixed_single_and_multi_command_config() -> None:
+    with pytest.raises(ValueError, match="exactly one of command_template or command_options"):
+        ActionModel(
+            kind="local_command",
+            message_template="Hello",
+            command_template="echo hi",
+            command_options=[LocalCommandOptionModel(id="deploy", label="Run deployment", command_template="./scripts/deploy.sh")],
+        )
 
 
 def test_install_ssh_key_with_password_rejects_unknown_host_trust(monkeypatch) -> None:
