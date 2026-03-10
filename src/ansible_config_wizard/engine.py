@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import configparser
 import copy
 import json
 import os
@@ -23,7 +24,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 
-from .generators import generate_value, load_ed25519_keypair
+from .generators import generate_password, generate_value, load_ed25519_keypair
 from .models import ActionModel, FieldModel, OutputModel, ProfileModel, SectionModel
 from .resolver import resolve_builder
 from .writers import atomic_write, backup_existing, secure_delete
@@ -1786,19 +1787,152 @@ def cleanup_generated_resume_state(answers_path: Path | None, context: dict[str,
         console.print(f"[cyan]Deleted[/cyan] {candidate}")
 
 
-def encrypt_vault_file(repo_root: Path, vault_password_file: str | None, console: Console) -> None:
-    vault_path = repo_root / "inventories/prod/group_vars/vault.yml"
+def inventory_vault_path(repo_root: Path) -> Path:
+    return repo_root / "inventories/prod/group_vars/vault.yml"
+
+
+def is_ansible_vault_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return handle.readline().startswith("$ANSIBLE_VAULT;")
+    except OSError:
+        return False
+
+
+def resolve_vault_password_file(repo_root: Path, raw_value: str | Path | None) -> Path | None:
+    if raw_value in (None, ""):
+        return None
+    candidate = Path(str(raw_value)).expanduser()
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    candidate = candidate.resolve()
+    if not candidate.is_file():
+        raise WizardError(f"Vault password file not found: {candidate}")
+    return candidate
+
+
+def configured_vault_password_file_path(repo_root: Path) -> Path | None:
+    env_value = os.environ.get("ANSIBLE_VAULT_PASSWORD_FILE")
+    if env_value:
+        candidate = Path(env_value).expanduser()
+        if not candidate.is_absolute():
+            candidate = repo_root / candidate
+        return candidate.resolve()
+
+    config_path = repo_root / "ansible.cfg"
+    if not config_path.is_file():
+        return None
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(config_path, encoding="utf-8")
+    except (configparser.Error, OSError):
+        return None
+    configured = parser.get("defaults", "vault_password_file", fallback="").strip()
+    if not configured:
+        return None
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return candidate.resolve()
+
+
+def configured_vault_password_file(repo_root: Path) -> Path | None:
+    candidate = configured_vault_password_file_path(repo_root)
+    if candidate is None or not candidate.is_file():
+        return None
+    return candidate
+
+
+def ensure_vault_password_file(path: Path, console: Console) -> Path:
+    ensure_private_dir(path.parent)
+    if path.exists():
+        path.chmod(0o600)
+        console.print(f"[cyan]Using existing[/cyan] vault password file {path}")
+        return path
+    atomic_write(path, generate_password(length=48) + "\n", 0o600)
+    console.print(f"[green]Wrote[/green] vault password file {path}")
+    return path
+
+
+def prompt_for_vault_password_file(
+    repo_root: Path,
+    prompt_default: Path | None,
+    context: dict[str, Any],
+    console: Console,
+) -> Path | None:
+    console.print()
+    console.print(
+        "Leave this blank to let Ansible prompt for the vault password interactively when needed.",
+        style="dim",
+    )
+    default_value = str(prompt_default) if prompt_default is not None else ""
+    value = ask_question(
+        questionary.text("Vault password file", default=default_value),
+        context,
+        console,
+    )
+    console.print()
+    return resolve_vault_password_file(repo_root, value.strip())
+
+
+def finalize_vault_password_file(
+    repo_root: Path,
+    current_value: str | Path | None,
+    assume_yes: bool,
+    context: dict[str, Any],
+    console: Console,
+    *,
+    needs_prompt: bool,
+    requires_noninteractive_value: bool,
+) -> Path | None:
+    resolved_current = resolve_vault_password_file(repo_root, current_value)
+    if resolved_current is not None:
+        return resolved_current
+
+    configured_default = configured_vault_password_file(repo_root)
+    if configured_default is not None:
+        return configured_default
+
+    if not needs_prompt:
+        return None
+
+    if assume_yes:
+        if requires_noninteractive_value:
+            raise WizardError(
+                "inventories/prod/group_vars/vault.yml is encrypted. Provide --vault-password-file, "
+                "set ANSIBLE_VAULT_PASSWORD_FILE, or rerun without --yes so Ansible can prompt."
+            )
+        return None
+
+    return prompt_for_vault_password_file(repo_root, configured_vault_password_file_path(repo_root), context, console)
+
+
+def preflight_vault_args(repo_root: Path, vault_password_file: Path | None) -> list[str]:
+    if vault_password_file is not None:
+        return ["--vault-password-file", str(vault_password_file)]
+    if is_ansible_vault_file(inventory_vault_path(repo_root)):
+        return ["--ask-vault-pass"]
+    return []
+
+
+def encrypt_vault_file(repo_root: Path, vault_password_file: Path | None, console: Console) -> None:
+    vault_path = inventory_vault_path(repo_root)
     command = ["ansible-vault", "encrypt", str(vault_path)]
     if vault_password_file:
-        command.extend(["--vault-password-file", vault_password_file])
+        command.extend(["--vault-password-file", str(vault_password_file)])
     console.print(f"[cyan]Encrypting[/cyan] {vault_path}")
     subprocess.run(command, check=True, cwd=repo_root)
 
 
-def run_preflight(repo_root: Path, console: Console) -> None:
+def run_preflight(repo_root: Path, console: Console, vault_password_file: Path | None = None) -> None:
     console.print("[cyan]Running[/cyan] preflight validation")
+    command = ["ansible-playbook", "-i", "inventories/prod/hosts.yml"]
+    command.extend(preflight_vault_args(repo_root, vault_password_file))
+    command.append("playbooks/preflight.yml")
     subprocess.run(
-        ["ansible-playbook", "-i", "inventories/prod/hosts.yml", "playbooks/preflight.yml"],
+        command,
         check=True,
         cwd=repo_root,
     )
@@ -1870,6 +2004,7 @@ def run_wizard(
     profile_path: Path,
     repo_root: Path,
     answers_path: Path | None = None,
+    vault_password_file: Path | None = None,
     assume_yes: bool = False,
     encrypt_override: bool | None = None,
     preflight_override: bool | None = None,
@@ -1902,6 +2037,8 @@ def run_wizard(
         provided_answers: dict[str, Any] = {}
     else:
         provided_answers = loaded_answers
+    if vault_password_file is not None:
+        provided_answers["vault_password_file"] = str(vault_password_file)
     if "wizard_last_interrupt_at" not in context:
         context["wizard_last_interrupt_at"] = 0.0
     if "wizard_resume_section_index" not in context:
@@ -2082,10 +2219,6 @@ def run_wizard(
         context,
         console,
     )
-    if encrypt_vault:
-        vault_password_file = provided_answers.get("vault_password_file")
-        encrypt_vault_file(repo_root, vault_password_file, console)
-
     explain_next_choice(
         console,
         "Preflight validation",
@@ -2100,8 +2233,65 @@ def run_wizard(
         context,
         console,
     )
+    configured_password_path = configured_vault_password_file_path(repo_root)
+    existing_password_file = finalize_vault_password_file(
+        repo_root,
+        context.get("vault_password_file", provided_answers.get("vault_password_file")),
+        False,
+        context,
+        console,
+        needs_prompt=False,
+        requires_noninteractive_value=False,
+    )
+    if (
+        configured_password_path is not None
+        and existing_password_file is None
+        and (encrypt_vault or run_preflight_now)
+    ):
+        explain_next_choice(
+            console,
+            "Vault password file",
+            "A managed vault password file lets deploy and preflight reuse the same local secret without extra prompts. "
+            "The file is stored at the repo's configured default path with 0600 permissions.",
+        )
+        create_vault_password_file = maybe_prompt_option(
+            provided_answers,
+            "create_vault_password_file",
+            f"Create the default vault password file at {display_path(configured_password_path, repo_root)}?",
+            True,
+            assume_yes,
+            context,
+            console,
+        )
+        if create_vault_password_file:
+            managed_password_file = ensure_vault_password_file(configured_password_path, console)
+            context["vault_password_file"] = str(managed_password_file)
+    if encrypt_vault:
+        encrypted_vault_password_file = finalize_vault_password_file(
+            repo_root,
+            context.get("vault_password_file", provided_answers.get("vault_password_file")),
+            assume_yes,
+            context,
+            console,
+            needs_prompt=True,
+            requires_noninteractive_value=False,
+        )
+        if encrypted_vault_password_file is not None:
+            context["vault_password_file"] = str(encrypted_vault_password_file)
+        encrypt_vault_file(repo_root, encrypted_vault_password_file, console)
     if run_preflight_now:
-        run_preflight(repo_root, console)
+        preflight_password_file = finalize_vault_password_file(
+            repo_root,
+            context.get("vault_password_file", provided_answers.get("vault_password_file")),
+            assume_yes,
+            context,
+            console,
+            needs_prompt=is_ansible_vault_file(inventory_vault_path(repo_root)),
+            requires_noninteractive_value=is_ansible_vault_file(inventory_vault_path(repo_root)),
+        )
+        if preflight_password_file is not None:
+            context["vault_password_file"] = str(preflight_password_file)
+        run_preflight(repo_root, console, preflight_password_file)
 
     cleanup_generated_resume_state(selected_answers_path, built, console)
 
