@@ -15,6 +15,7 @@ from ansible_config_wizard.engine import (
     WizardPaused,
     ask_question,
     build_ssh_setup_commands,
+    completed_visible_sections,
     evaluate_condition,
     latest_resume_state_path,
     previous_visible_section_index,
@@ -129,6 +130,21 @@ def test_previous_visible_section_index_skips_hidden_sections() -> None:
     assert previous_visible_section_index(sections, {"enabled": True}, 2) == 1
 
 
+def test_completed_visible_sections_include_current_step() -> None:
+    sections = [
+        SectionModel(id="one", title="One"),
+        SectionModel(id="two", title="Two", when="enabled"),
+        SectionModel(id="three", title="Three"),
+    ]
+
+    completed = completed_visible_sections(sections, {"enabled": False}, 2)
+
+    assert [(index, step_number, section.id) for index, step_number, section in completed] == [
+        (0, 1, "one"),
+        (2, 2, "three"),
+    ]
+
+
 def test_latest_resume_state_path_picks_newest(tmp_path: Path) -> None:
     wizard_state_dir = tmp_path / "sample" / "repo"
     older = wizard_state_dir / "runs" / "20260101-000000" / "config-wizard-state.yml"
@@ -214,4 +230,29 @@ def test_ask_question_exits_on_second_consecutive_interrupt(tmp_path: Path, monk
     with pytest.raises(WizardPaused):
         ask_question(AlwaysInterrupt(), context, console)
 
+    assert state_path.exists()
+
+
+def test_ask_question_treats_none_as_interrupt(tmp_path: Path, monkeypatch) -> None:
+    class NoneThenAnswer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def ask(self) -> str | None:
+            self.calls += 1
+            if self.calls == 1:
+                return None
+            return "continue"
+
+    state_path = tmp_path / "config-wizard-state.yml"
+    context = {
+        "wizard_resume_enabled": True,
+        "wizard_resume_state_path": str(state_path),
+        "wizard_current_section_index": 3,
+    }
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    answer = ask_question(NoneThenAnswer(), context, console)
+
+    assert answer == "continue"
     assert state_path.exists()

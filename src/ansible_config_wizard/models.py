@@ -67,5 +67,6 @@ class ProfileModel(BaseModel):
     name: str
     builder: str | None = None
     defaults: dict[str, Any] = Field(default_factory=dict)
+    startup_fields: list[FieldModel] = Field(default_factory=list)
     sections: list[SectionModel]
     outputs: list[OutputModel]

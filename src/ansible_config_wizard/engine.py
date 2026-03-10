@@ -149,21 +149,28 @@ def exit_on_interrupt(context: dict[str, Any], console: Console) -> None:
     raise WizardPaused("Wizard interrupted by operator.")
 
 
+def handle_prompt_interrupt(context: dict[str, Any], console: Console) -> None:
+    interrupted_at = monotonic()
+    last_interrupt = float(context.get("wizard_last_interrupt_at", 0.0))
+    if interrupted_at - last_interrupt <= 2.5:
+        exit_on_interrupt(context, console)
+    resume_state_path = persist_progress(context)
+    console.print()
+    if resume_state_path is not None:
+        console.print(f"[yellow]Progress saved to:[/yellow] [bold]{resume_state_path}[/bold]")
+    console.print("[yellow]Press Ctrl-C again to exit, or continue with this step.[/yellow]")
+    context["wizard_last_interrupt_at"] = interrupted_at
+
+
 def ask_question(prompt: Any, context: dict[str, Any], console: Console) -> Any:
     while True:
         try:
             value = prompt.ask()
         except KeyboardInterrupt:
-            interrupted_at = monotonic()
-            last_interrupt = float(context.get("wizard_last_interrupt_at", 0.0))
-            if interrupted_at - last_interrupt <= 2.5:
-                exit_on_interrupt(context, console)
-            resume_state_path = persist_progress(context)
-            console.print()
-            if resume_state_path is not None:
-                console.print(f"[yellow]Progress saved to:[/yellow] [bold]{resume_state_path}[/bold]")
-            console.print("[yellow]Press Ctrl-C again to exit, or continue with this step.[/yellow]")
-            context["wizard_last_interrupt_at"] = interrupted_at
+            handle_prompt_interrupt(context, console)
+            continue
+        if value is None:
+            handle_prompt_interrupt(context, console)
             continue
         context["wizard_last_interrupt_at"] = 0.0
         return value
@@ -577,6 +584,48 @@ def previous_visible_section_index(sections: list[SectionModel], context: dict[s
     return None
 
 
+def completed_visible_sections(
+    sections: list[SectionModel],
+    context: dict[str, Any],
+    current_index: int,
+) -> list[tuple[int, int, SectionModel]]:
+    completed: list[tuple[int, int, SectionModel]] = []
+    step_number = 0
+    for index, section in enumerate(sections):
+        if not evaluate_condition(section.when, context):
+            continue
+        step_number += 1
+        if index <= current_index:
+            completed.append((index, step_number, section))
+    return completed
+
+
+def choose_completed_section(
+    profile: ProfileModel,
+    context: dict[str, Any],
+    current_index: int,
+    console: Console,
+) -> int | None:
+    completed = completed_visible_sections(profile.sections, context, current_index)
+    if not completed:
+        return None
+
+    labels = [f"Step {step_number}: {section.title}" for index, step_number, section in completed]
+    label_to_index = {label: index for label, (index, _, _) in zip(labels, completed, strict=True)}
+    console.print()
+    choice = ask_question(
+        questionary.select(
+            "Which completed step do you want to revisit?",
+            choices=labels,
+            default=labels[-1],
+        ),
+        context,
+        console,
+    )
+    console.print()
+    return label_to_index[choice]
+
+
 def write_action_commands(section: SectionModel, commands: str, context: dict[str, Any]) -> Path:
     path = Path(context["wizard_run_dir"]) / f"{slugify(section.id)}-commands.sh"
     script = "#!/usr/bin/env bash\nset -euo pipefail\n\n" + commands.strip() + "\n"
@@ -927,6 +976,15 @@ def render_welcome(console: Console, profile: ProfileModel, assume_yes: bool) ->
     )
 
 
+def render_startup_intro(console: Console) -> None:
+    console.print()
+    console.print("[bold cyan]Startup choices[/bold cyan]")
+    console.print(
+        "A few top-level preferences shape the rest of the run before the numbered steps begin.",
+        style="dim",
+    )
+
+
 def render_section_intro(console: Console, section: SectionModel, index: int) -> None:
     body = ""
     if section.description:
@@ -1208,6 +1266,11 @@ def run_wizard(
     answered_collections: set[str] = set()
 
     render_welcome(console, profile, assume_yes)
+    if profile.startup_fields:
+        render_startup_intro(console)
+        startup_section = SectionModel(id="startup", title="Startup", fields=profile.startup_fields)
+        collect_fields(startup_section, context, provided_answers, assume_yes, console, repo_root, answered_fields)
+        persist_progress(context, 0)
 
     section_index = int(context.get("wizard_resume_section_index", 0))
     while section_index < len(profile.sections):
@@ -1240,8 +1303,8 @@ def run_wizard(
             continue
 
         nav_choices = ["Continue"]
-        if previous_visible_section_index(profile.sections, context, section_index) is not None:
-            nav_choices.append("Go back")
+        if completed_visible_sections(profile.sections, context, section_index):
+            nav_choices.append("Review a completed step")
         console.print()
         navigation = ask_question(
             questionary.select(
@@ -1253,9 +1316,10 @@ def run_wizard(
             console,
         )
         console.print()
-        if navigation == "Go back":
-            previous_index = previous_visible_section_index(profile.sections, context, section_index)
+        if navigation == "Review a completed step":
+            previous_index = choose_completed_section(profile, context, section_index, console)
             if previous_index is not None:
+                persist_progress(context, previous_index)
                 section_index = previous_index
                 continue
         section_index += 1
