@@ -203,6 +203,10 @@ def prompt_field(field: FieldModel, default: Any, console: Console) -> Any:
     prompt = field.label
     if field.help:
         console.print(field.help, style="dim")
+    if default not in (None, "", [], {}) and field.type not in {"confirm", "password", "ssh_keypair"}:
+        console.print(f"Default: {default}", style="dim")
+    if field.type == "confirm":
+        console.print(f"Default: {'yes' if bool(default) else 'no'}", style="dim")
 
     if field.type == "confirm":
         return questionary.confirm(prompt, default=bool(default)).ask()
@@ -361,6 +365,10 @@ def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: 
     if assume_yes:
         count = count_default
     else:
+        console.print(
+            f"We'll set these up one at a time so the values stay easy to reason about.",
+            style="dim",
+        )
         count = int(
             questionary.text(
                 f"{section.title}: how many {section.item_label}s?",
@@ -370,7 +378,13 @@ def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: 
     count = max(count, section.min_items)
 
     for index in range(1, count + 1):
-        console.print(Panel.fit(f"{section.item_label.title()} {index}", border_style="cyan"))
+        console.print(
+            Panel.fit(
+                f"{section.item_label.title()} {index}",
+                border_style="cyan",
+                box=box.ROUNDED,
+            )
+        )
         item_context = copy.deepcopy(context)
         item_context["item_index"] = index
         item: dict[str, Any] = {}
@@ -686,6 +700,36 @@ def render_section_intro(console: Console, section: SectionModel, index: int) ->
     )
 
 
+def render_review_summary(console: Console, built: dict[str, Any], rendered_outputs: list[tuple[OutputModel, str]], repo_root: Path) -> None:
+    summary_lines = [
+        f"Host: {built.get('host_name', 'unset')}",
+        f"Primary address: {built.get('ansible_host', 'unset')}",
+        f"SSH user: {built.get('ansible_user', 'unset')}",
+    ]
+    if built.get("feature_obsidian_enabled"):
+        summary_lines.append(
+            f"Obsidian: enabled via {built.get('obsidian_access_mode', 'unset')}"
+        )
+    else:
+        summary_lines.append("Obsidian: disabled")
+    if built.get("restic_enabled"):
+        summary_lines.append(
+            f"Backups: enabled with {len(built.get('restic_targets', []))} target(s)"
+        )
+    else:
+        summary_lines.append("Backups: disabled")
+    summary_lines.append(f"Outputs: {', '.join(display_path(repo_root / render_template_string(output.path, built), repo_root) for output, _ in rendered_outputs)}")
+    console.print(
+        Panel(
+            "\n".join(summary_lines) + "\n\n[dim]Next, the wizard will write files and offer the optional safety steps.[/dim]",
+            title="[bold magenta]Review[/bold magenta]",
+            border_style="magenta",
+            box=box.ROUNDED,
+            padding=(0, 2),
+        )
+    )
+
+
 def yaml_value(value: Any) -> str:
     text = yaml.safe_dump(value, sort_keys=False, default_flow_style=True).strip()
     text = "\n".join(line for line in text.splitlines() if line not in {"---", "..."})
@@ -812,6 +856,11 @@ def maybe_prompt_option(
     return bool(questionary.confirm(prompt, default=default).ask())
 
 
+def explain_next_choice(console: Console, title: str, body: str) -> None:
+    console.print(f"[bold]{title}[/bold]", style="cyan")
+    console.print(body, style="dim")
+
+
 def run_wizard(
     profile_path: Path,
     repo_root: Path,
@@ -856,9 +905,19 @@ def run_wizard(
             collect_repeatable(section, context, provided_answers, assume_yes, console, repo_root)
         run_section_actions(section, context, repo_root, assume_yes, console)
 
+    explain_next_choice(
+        console,
+        "Optional record file",
+        "A private details file can capture setup notes and, if you choose, raw secrets for handoff or safekeeping.",
+    )
     write_details = maybe_prompt_option(provided_answers, "write_details", "Write sensitive details file?", False, assume_yes)
     include_secret_details = False
     if write_details:
+        explain_next_choice(
+            console,
+            "Raw secrets in the record file",
+            "Including raw secrets makes handoff easier, but it also creates another sensitive file to protect or delete afterward.",
+        )
         include_secret_details = maybe_prompt_option(
             provided_answers,
             "include_secret_details",
@@ -866,6 +925,11 @@ def run_wizard(
             False,
             assume_yes,
         )
+    explain_next_choice(
+        console,
+        "Optional audit log",
+        "The audit log records what the wizard did without storing raw secrets. It is useful for traceability and reruns.",
+    )
     write_log = maybe_prompt_option(provided_answers, "write_log", "Write sanitized audit log?", False, assume_yes)
 
     context["write_details"] = write_details
@@ -878,6 +942,7 @@ def run_wizard(
     built["include_secret_details"] = include_secret_details
 
     rendered_outputs = render_outputs(profile, built, template_root)
+    render_review_summary(console, built, rendered_outputs, repo_root)
     for output, _ in rendered_outputs:
         backup_existing(repo_root / render_template_string(output.path, built))
 
@@ -891,6 +956,11 @@ def run_wizard(
         log_path = write_audit_log(repo_root, built)
         console.print(f"[green]Wrote[/green] {display_path(log_path, repo_root)}")
 
+    explain_next_choice(
+        console,
+        "Vault encryption",
+        "If you encrypt vault.yml now, the secret file is protected before any real deployment steps begin.",
+    )
     encrypt_vault = encrypt_override if encrypt_override is not None else maybe_prompt_option(
         provided_answers,
         "encrypt_vault",
@@ -902,6 +972,11 @@ def run_wizard(
         vault_password_file = provided_answers.get("vault_password_file")
         encrypt_vault_file(repo_root, vault_password_file, console)
 
+    explain_next_choice(
+        console,
+        "Preflight validation",
+        "Preflight checks the generated inventory for missing values, risky combinations, and obvious deployment blockers before you touch the host.",
+    )
     run_preflight_now = preflight_override if preflight_override is not None else maybe_prompt_option(
         provided_answers,
         "run_preflight",
