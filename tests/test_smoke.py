@@ -18,7 +18,9 @@ from ansible_config_wizard.engine import (
     completed_visible_sections,
     describe_next_step,
     evaluate_condition,
+    furthest_resume_index,
     latest_resume_state_path,
+    persist_progress,
     previous_visible_section_index,
     resolve_field,
     run_wizard,
@@ -220,6 +222,24 @@ def test_describe_next_step_uses_following_visible_section() -> None:
 
     assert describe_next_step(profile, {"enabled": False}, 0) == "Continue to Step 2: Three"
     assert describe_next_step(profile, {"enabled": True}, 1) == "Continue to Step 3: Three"
+    assert describe_next_step(profile, {"enabled": False}, -1) == "Continue to Step 1: One"
+
+
+def test_persist_progress_preserves_furthest_resume_index(tmp_path: Path) -> None:
+    state_path = tmp_path / "config-wizard-state.yml"
+    context = {
+        "wizard_resume_enabled": True,
+        "wizard_resume_state_path": str(state_path),
+        "wizard_resume_section_index": 3,
+        "wizard_furthest_resume_index": 4,
+    }
+
+    persist_progress(context, 2)
+
+    assert furthest_resume_index(context) == 4
+    saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+    assert saved["wizard_resume_section_index"] == 2
+    assert saved["wizard_furthest_resume_index"] == 4
 
 
 def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -> None:

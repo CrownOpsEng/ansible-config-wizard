@@ -125,6 +125,10 @@ def current_section_index(context: dict[str, Any]) -> int:
     return int(context.get("wizard_current_section_index", 0))
 
 
+def furthest_resume_index(context: dict[str, Any]) -> int:
+    return int(context.get("wizard_furthest_resume_index", context.get("wizard_resume_section_index", 0)))
+
+
 def write_resume_state(context: dict[str, Any], section_index: int | None = None) -> Path:
     path = Path(context["wizard_resume_state_path"])
     ensure_private_dir(path.parent)
@@ -132,6 +136,10 @@ def write_resume_state(context: dict[str, Any], section_index: int | None = None
     snapshot["wizard_resume_enabled"] = True
     snapshot["wizard_resume_state"] = True
     snapshot["wizard_resume_section_index"] = current_section_index(context) if section_index is None else section_index
+    snapshot["wizard_furthest_resume_index"] = max(
+        int(snapshot["wizard_resume_section_index"]),
+        int(snapshot.get("wizard_furthest_resume_index", 0)),
+    )
     atomic_write(path, yaml.safe_dump(snapshot, sort_keys=False), 0o600)
     return path
 
@@ -139,6 +147,9 @@ def write_resume_state(context: dict[str, Any], section_index: int | None = None
 def persist_progress(context: dict[str, Any], section_index: int | None = None) -> Path | None:
     if not context.get("wizard_resume_enabled"):
         return None
+    if section_index is not None:
+        context["wizard_resume_section_index"] = section_index
+        context["wizard_furthest_resume_index"] = max(section_index, furthest_resume_index(context))
     return write_resume_state(context, section_index)
 
 
@@ -669,20 +680,26 @@ def choose_completed_section(
     profile: ProfileModel,
     context: dict[str, Any],
     current_index: int,
+    resume_index: int,
     console: Console,
 ) -> int | None:
     completed = completed_visible_sections(profile.sections, context, current_index)
-    if not completed:
+    resume_label = describe_next_step(profile, context, resume_index - 1)
+    labels = [resume_label]
+    label_to_index = {resume_label: resume_index}
+    for index, step_number, section in completed:
+        label = f"Review Step {step_number}: {section.title}"
+        labels.append(label)
+        label_to_index[label] = index
+    if not labels:
         return None
 
-    labels = [f"Step {step_number}: {section.title}" for index, step_number, section in completed]
-    label_to_index = {label: index for label, (index, _, _) in zip(labels, completed, strict=True)}
     console.print()
     choice = ask_question(
         questionary.select(
-            "Which completed step do you want to revisit?",
+            "Choose a step to review, or resume from the furthest completed point.",
             choices=labels,
-            default=labels[-1],
+            default=resume_label,
         ),
         context,
         console,
@@ -1358,6 +1375,10 @@ def run_wizard(
         provided_answers = loaded_answers
     if "wizard_last_interrupt_at" not in context:
         context["wizard_last_interrupt_at"] = 0.0
+    if "wizard_resume_section_index" not in context:
+        context["wizard_resume_section_index"] = 0
+    if "wizard_furthest_resume_index" not in context:
+        context["wizard_furthest_resume_index"] = int(context["wizard_resume_section_index"])
     if assume_yes:
         context["wizard_resume_enabled"] = bool(context.get("wizard_resume_enabled", False))
     elif is_resume_state:
@@ -1388,10 +1409,11 @@ def run_wizard(
         persist_progress(context, 0)
 
     section_index = int(context.get("wizard_resume_section_index", 0))
-    if is_resume_state and not assume_yes and section_index <= len(profile.sections):
-        section_index = choose_resume_section(profile, context, section_index, console)
+    if is_resume_state and not assume_yes and furthest_resume_index(context) <= len(profile.sections):
+        section_index = choose_resume_section(profile, context, furthest_resume_index(context), console)
     while section_index < len(profile.sections):
         context["wizard_current_section_index"] = section_index
+        context["wizard_resume_section_index"] = section_index
         section = profile.sections[section_index]
         if not evaluate_condition(section.when, context):
             section_index += 1
@@ -1419,13 +1441,14 @@ def run_wizard(
             section_index += 1
             continue
 
-        nav_choices = [describe_next_step(profile, context, section_index)]
-        if completed_visible_sections(profile.sections, context, section_index):
+        resume_index = furthest_resume_index(context)
+        nav_choices = [describe_next_step(profile, context, resume_index - 1)]
+        if completed_visible_sections(profile.sections, context, resume_index - 1):
             nav_choices.append("Review a completed step")
         console.print()
         navigation = ask_question(
             questionary.select(
-                "Ready for the next step?",
+                "What do you want to do next?",
                 choices=nav_choices,
                 default=nav_choices[0],
             ),
@@ -1434,12 +1457,11 @@ def run_wizard(
         )
         console.print()
         if navigation == "Review a completed step":
-            previous_index = choose_completed_section(profile, context, section_index, console)
+            previous_index = choose_completed_section(profile, context, resume_index - 1, resume_index, console)
             if previous_index is not None:
-                persist_progress(context, previous_index)
                 section_index = previous_index
                 continue
-        section_index += 1
+        section_index = resume_index
 
     explain_next_choice(
         console,
