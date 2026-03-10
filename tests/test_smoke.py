@@ -159,6 +159,38 @@ def test_install_ssh_key_with_password_rejects_unknown_host_trust(monkeypatch) -
         install_ssh_key_with_password("203.0.113.10", "ubuntu", "/tmp/test.pub", "secret", console)
 
 
+def test_resolve_field_supports_guided_known_hosts_scan(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "ansible_config_wizard.engine.prompt_for_known_hosts_value",
+        lambda field, context, console, host, port, display_default, prompt_default: "backup.example.com ssh-ed25519 AAAA",
+    )
+    field = FieldModel(
+        id="ssh_known_hosts",
+        label="Pinned host keys",
+        type="multiline_text",
+        source={
+            "kind": "known_hosts_scan",
+            "params": {
+                "host_template": "{{ sftp_host }}",
+                "port_template": "{{ sftp_port }}",
+            },
+        },
+    )
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    value = resolve_field(
+        field,
+        {"sftp_host": "backup.example.com", "sftp_port": 2222},
+        provided_value=None,
+        current_value=None,
+        assume_yes=False,
+        console=console,
+        repo_root=tmp_path,
+    )
+
+    assert value == "backup.example.com ssh-ed25519 AAAA"
+
+
 def test_build_ssh_setup_commands_disables_agent_keys() -> None:
     commands = build_ssh_setup_commands(
         host="203.0.113.10",

@@ -465,6 +465,200 @@ def materialize_generated_value(
     return result
 
 
+def ssh_host_lookup_name(host: str, port: int | str) -> str:
+    port_value = int(port)
+    if port_value == 22:
+        return host
+    return f"[{host}]:{port_value}"
+
+
+def scan_known_hosts_entries(host: str, port: int | str) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["ssh-keyscan", "-p", str(port), host],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def group_known_hosts_entries(entries: list[str]) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for line in entries:
+        parts = line.split()
+        key_type = parts[1] if len(parts) > 1 else "unknown"
+        grouped.setdefault(key_type, []).append(line)
+    return grouped
+
+
+def trusted_known_hosts_value(
+    field: FieldModel,
+    display_default: Any,
+    prompt_default: Any,
+    console: Console,
+    context: dict[str, Any],
+) -> str:
+    value = prompt_field(field, display_default, prompt_default, console, context)
+    return str(value or "").strip()
+
+
+def prompt_for_known_hosts_value(
+    field: FieldModel,
+    context: dict[str, Any],
+    console: Console,
+    host: str,
+    port: int | str,
+    display_default: Any,
+    prompt_default: Any,
+) -> str:
+    scan_target = ssh_host_lookup_name(host, port)
+    while True:
+        console.print()
+        console.print(f"[bold]{field.label}[/bold]", style="cyan")
+        if field.help:
+            console.print(field.help, style="dim")
+        console.print(
+            f"The wizard can scan {scan_target} on your machine and let you choose which host keys to trust.",
+            style="dim",
+        )
+        choice = ask_question(
+            questionary.select(
+                "How would you like to set the trusted host keys?",
+                choices=[
+                    "Scan now",
+                    "Paste manually",
+                    "Leave blank for now",
+                ],
+                default="Scan now",
+            ),
+            context,
+            console,
+        )
+        console.print()
+        if choice == "Paste manually":
+            return trusted_known_hosts_value(field, display_default, prompt_default, console, context)
+        if choice == "Leave blank for now":
+            return ""
+
+        console.print(f"[cyan]Scanning[/cyan] {scan_target} with ssh-keyscan...")
+        entries = scan_known_hosts_entries(host, port)
+        if not entries:
+            console.print("[yellow]No host keys were returned by ssh-keyscan.[/yellow]")
+            retry = ask_question(
+                questionary.select(
+                    "What do you want to do next?",
+                    choices=["Try scan again", "Paste manually", "Leave blank for now"],
+                    default="Try scan again",
+                ),
+                context,
+                console,
+            )
+            console.print()
+            if retry == "Paste manually":
+                return trusted_known_hosts_value(field, display_default, prompt_default, console, context)
+            if retry == "Leave blank for now":
+                return ""
+            continue
+
+        grouped = group_known_hosts_entries(entries)
+        console.print()
+        console.print("[cyan]Scanned host keys[/cyan]")
+        for key_type, lines in grouped.items():
+            console.print(f"  {key_type}: {len(lines)} entr{'y' if len(lines) == 1 else 'ies'}")
+        console.print()
+
+        preferred_type = next((key_type for key_type in ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa") if key_type in grouped), next(iter(grouped)))
+        selection_choices = [f"Use {preferred_type} only (recommended)"]
+        selection_map = {selection_choices[0]: grouped[preferred_type]}
+        for key_type in grouped:
+            if key_type == preferred_type:
+                continue
+            label = f"Use {key_type} only"
+            selection_choices.append(label)
+            selection_map[label] = grouped[key_type]
+        if len(entries) > 1:
+            selection_choices.append("Use all scanned keys")
+            selection_map["Use all scanned keys"] = entries
+        selection_choices.extend(["Scan again", "Paste manually", "Leave blank for now"])
+
+        selection = ask_question(
+            questionary.select(
+                "Which scanned keys should the wizard trust?",
+                choices=selection_choices,
+                default=selection_choices[0],
+            ),
+            context,
+            console,
+        )
+        console.print()
+        if selection == "Scan again":
+            continue
+        if selection == "Paste manually":
+            return trusted_known_hosts_value(field, display_default, prompt_default, console, context)
+        if selection == "Leave blank for now":
+            return ""
+
+        selected_entries = selection_map[selection]
+        console.print("Chosen host-key pin:")
+        console.print("\n".join(selected_entries), markup=False, highlight=False, no_wrap=True, overflow="ignore")
+        console.print()
+        confirmed = ask_question(
+            questionary.confirm(
+                "Use these keys as the trusted pin after you verify them out of band?",
+                default=False,
+            ),
+            context,
+            console,
+        )
+        console.print()
+        if confirmed:
+            return "\n".join(selected_entries)
+
+
+def is_host_key_trusted_locally(host: str, port: int | str) -> bool:
+    lookup_name = ssh_host_lookup_name(host, port)
+    result = subprocess.run(
+        ["ssh-keygen", "-F", lookup_name],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def add_known_hosts_entries(entries: list[str], known_hosts_path: Path) -> None:
+    ensure_private_dir(known_hosts_path.parent)
+    existing_lines: list[str] = []
+    if known_hosts_path.exists():
+        existing_lines = [line.rstrip("\n") for line in known_hosts_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    existing_set = set(existing_lines)
+    merged = existing_lines + [line for line in entries if line not in existing_set]
+    content = "\n".join(merged).rstrip() + "\n" if merged else ""
+    atomic_write(known_hosts_path, content, 0o600)
+
+
+def guide_local_host_trust(host: str, port: int | str, context: dict[str, Any], console: Console) -> bool:
+    lookup_name = ssh_host_lookup_name(host, port)
+    field = FieldModel(
+        id="known_hosts",
+        label=f"Trusted host keys for {lookup_name}",
+        type="multiline_text",
+        help="Choose a verified host-key pin for this SSH server before the wizard installs your managed key.",
+    )
+    selected = prompt_for_known_hosts_value(field, context, console, host, port, None, None)
+    if not selected:
+        return False
+    entries = [line for line in selected.splitlines() if line.strip()]
+    add_known_hosts_entries(entries, Path.home() / ".ssh" / "known_hosts")
+    console.print(f"[green]Added trusted host keys for[/green] {lookup_name} [green]to[/green] ~/.ssh/known_hosts")
+    console.print()
+    return True
+
+
 def resolve_field(
     field: FieldModel,
     context: dict[str, Any],
@@ -521,6 +715,20 @@ def resolve_field(
         )
         reference = ask_question(questionary.text(f"{field.label}: secret reference or ID"), context, console)
         return {"driver": driver, "ref": {"id": reference or ""}}
+
+    if source.kind == "known_hosts_scan":
+        if assume_yes:
+            if prompt_default not in (None, "", [], {}):
+                return normalize_value(field, prompt_default)
+            if field.required:
+                raise WizardError(f"Missing value for required field: {field.id}")
+            return ""
+        host = render_template_string(source.params.get("host_template"), context)
+        port = render_template_string(source.params.get("port_template"), context) or "22"
+        value = prompt_for_known_hosts_value(field, context, console, str(host), port, display_default, prompt_default)
+        if field.required and value in (None, "", [], {}):
+            raise WizardError(f"Value required for field: {field.id}")
+        return normalize_value(field, value)
 
     if assume_yes:
         if prompt_default not in (None, "", [], {}):
@@ -1056,6 +1264,7 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
     ssh_user = render_template_string(action.ssh_user_template, context)
     public_key_path = render_template_string(action.public_key_path_template, context)
     private_key_path = render_template_string(action.private_key_path_template, context)
+    port = context.get("ansible_port", 22)
     resume_command = f"./scripts/configure.sh --answers-file {context['wizard_resume_state_path']}"
     commands = (
         render_template_string(action.commands_template, context).strip()
@@ -1107,6 +1316,14 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
             console,
         )
         if choice == "Install now (recommended)":
+            if not is_host_key_trusted_locally(host, port):
+                console.print(
+                    f"[yellow]{ssh_host_lookup_name(host, port)} is not trusted locally yet.[/yellow]",
+                )
+                trusted_now = guide_local_host_trust(host, port, context, console)
+                if not trusted_now:
+                    manual_requested = True
+                    continue
             password = ask_question(questionary.password(f"Password for {ssh_user}@{host}"), context, console)
             if not password:
                 console.print("[yellow]No password entered.[/yellow]")

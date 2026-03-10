@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class SourceModel(BaseModel):
-    kind: Literal["prompt", "generate", "optional_prompt", "external_vault"] = "prompt"
+    kind: Literal["prompt", "generate", "optional_prompt", "external_vault", "known_hosts_scan"] = "prompt"
     generator: str | None = None
     driver: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
