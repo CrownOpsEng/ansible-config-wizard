@@ -473,13 +473,45 @@ def ssh_command_env() -> dict[str, str]:
     return env
 
 
+def quote_shell_value(value: str) -> str:
+    escaped = value.replace("'", "'\"'\"'")
+    return f"'{escaped}'"
+
+
 def format_shell_command(parts: list[str]) -> str:
     if not parts:
         return ""
-    rendered = [shlex.quote(part) for part in parts]
-    if len(rendered) == 1:
-        return rendered[0]
-    return f"{rendered[0]} \\\n  " + " \\\n  ".join(rendered[1:])
+    remaining = list(parts)
+    lines: list[str] = []
+
+    if len(remaining) >= 3 and remaining[0] == "env" and remaining[1] == "-u":
+        lines.append(f"env -u {remaining[2]} \\")
+        remaining = remaining[3:]
+
+    if not remaining:
+        return "\n".join(lines).rstrip("\\").rstrip()
+
+    lines.append(f"  {shlex.quote(remaining[0])} \\")
+    remaining = remaining[1:]
+
+    flags_with_values = {"-o", "-i", "-p", "-l", "-J", "-F"}
+    index = 0
+    while index < len(remaining):
+        token = remaining[index]
+        if token in flags_with_values and index + 1 < len(remaining):
+            value = remaining[index + 1]
+            lines.append(f"  {token} {quote_shell_value(value)} \\")
+            index += 2
+            continue
+        if token.startswith("-"):
+            lines.append(f"  {token} \\")
+        else:
+            lines.append(f"  {quote_shell_value(token)} \\")
+        index += 1
+
+    if lines:
+        lines[-1] = lines[-1].removesuffix(" \\")
+    return "\n".join(lines)
 
 
 def build_ssh_setup_commands(host: str, ssh_user: str, public_key_path: str, private_key_path: str, resume_command: str) -> str:
@@ -518,7 +550,7 @@ def build_ssh_setup_commands(host: str, ssh_user: str, public_key_path: str, pri
             target,
         ]
     )
-    return "\n".join([copy_id, verify, resume_command.strip()])
+    return "\n\n".join([copy_id, verify, resume_command.strip()])
 
 
 def install_ssh_key_with_password(
@@ -530,11 +562,16 @@ def install_ssh_key_with_password(
 ) -> None:
     command = [
         "ssh-copy-id",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "IdentityAgent=none",
-        "-o", "PreferredAuthentications=password",
-        "-o", "PubkeyAuthentication=no",
-        "-i", public_key_path,
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "IdentityAgent=none",
+        "-o",
+        "PreferredAuthentications=password",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-i",
+        public_key_path,
         f"{ssh_user}@{host}",
     ]
     console.print("[cyan]Running local SSH key install:[/cyan]")
@@ -542,7 +579,8 @@ def install_ssh_key_with_password(
         format_shell_command(["env", "-u", "SSH_AUTH_SOCK", *command]),
         markup=False,
         highlight=False,
-        soft_wrap=True,
+        no_wrap=True,
+        overflow="ignore",
     )
     console.print()
     child = pexpect.spawn(command[0], command[1:], env=ssh_command_env(), encoding="utf-8", timeout=30, echo=False)
@@ -612,7 +650,7 @@ def render_manual_action_commands(
     console.print(str(command_path), soft_wrap=True, highlight=False)
     console.print()
     console.print("[cyan]Manual commands[/cyan]")
-    console.print(commands, soft_wrap=True, highlight=False)
+    console.print(commands, markup=False, highlight=False, no_wrap=True, overflow="ignore")
     console.print()
 
 
@@ -699,7 +737,7 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
             console.print("[green]Managed SSH key installed and verified.[/green]")
             console.print()
             console.print("[cyan]Direct login check[/cyan]")
-            console.print(login_command, soft_wrap=True, highlight=False)
+            console.print(login_command, markup=False, highlight=False, no_wrap=True, overflow="ignore")
             console.print()
             return
         if choice == "Show manual steps":

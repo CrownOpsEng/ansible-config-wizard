@@ -95,6 +95,11 @@ def test_build_ssh_setup_commands_disables_agent_keys() -> None:
     assert "IdentitiesOnly=yes" in commands
     assert "IdentityAgent=none" in commands
     assert "203.0.113.10" in commands
+    assert commands.startswith("env -u SSH_AUTH_SOCK \\\n  ssh-copy-id \\")
+    assert "\n  -o 'IdentitiesOnly=yes' \\\n" in commands
+    assert "\n  -i '/tmp/test key.pub' \\\n" in commands
+    assert "\n  'ubuntu@203.0.113.10'\n" in commands
+    assert "\n\nenv -u SSH_AUTH_SOCK \\\n  ssh \\\n" in commands
 
 
 def test_redacting_console_writer_masks_secrets() -> None:
