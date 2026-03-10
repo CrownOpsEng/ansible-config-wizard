@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import os
 from pathlib import Path
 
 import yaml
@@ -11,12 +12,16 @@ from rich.console import Console
 from ansible_config_wizard.engine import (
     RedactingConsoleWriter,
     WizardError,
+    WizardPaused,
+    ask_question,
     build_ssh_setup_commands,
     evaluate_condition,
+    latest_resume_state_path,
     previous_visible_section_index,
+    resolve_field,
     run_wizard,
 )
-from ansible_config_wizard.models import SectionModel
+from ansible_config_wizard.models import FieldModel, SectionModel
 
 
 class Buffer:
@@ -122,3 +127,91 @@ def test_previous_visible_section_index_skips_hidden_sections() -> None:
 
     assert previous_visible_section_index(sections, {"enabled": False}, 2) == 0
     assert previous_visible_section_index(sections, {"enabled": True}, 2) == 1
+
+
+def test_latest_resume_state_path_picks_newest(tmp_path: Path) -> None:
+    wizard_state_dir = tmp_path / "sample" / "repo"
+    older = wizard_state_dir / "runs" / "20260101-000000" / "config-wizard-state.yml"
+    newer = wizard_state_dir / "runs" / "20260101-000100" / "config-wizard-state.yml"
+    older.parent.mkdir(parents=True, exist_ok=True)
+    newer.parent.mkdir(parents=True, exist_ok=True)
+    older.write_text("older: true\n", encoding="utf-8")
+    newer.write_text("newer: true\n", encoding="utf-8")
+    os.utime(older, (1, 1))
+    os.utime(newer, (2, 2))
+
+    assert latest_resume_state_path(wizard_state_dir) == newer
+
+
+def test_resolve_field_reuses_current_value_as_default(monkeypatch, tmp_path: Path) -> None:
+    defaults_seen: list[str] = []
+
+    def fake_prompt_field(field, default, console, context):
+        defaults_seen.append(default)
+        return default
+
+    monkeypatch.setattr("ansible_config_wizard.engine.prompt_field", fake_prompt_field)
+    field = FieldModel(id="host_name", label="Host name")
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    value = resolve_field(
+        field,
+        {"host_name": "demo-01"},
+        provided_value=None,
+        current_value="demo-01",
+        assume_yes=False,
+        console=console,
+        repo_root=tmp_path,
+    )
+
+    assert value == "demo-01"
+    assert defaults_seen == ["demo-01"]
+
+
+def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -> None:
+    class InterruptThenAnswer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def ask(self) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                raise KeyboardInterrupt
+            return "continue"
+
+    state_path = tmp_path / "config-wizard-state.yml"
+    context = {
+        "wizard_resume_enabled": True,
+        "wizard_resume_state_path": str(state_path),
+        "wizard_current_section_index": 2,
+    }
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    answer = ask_question(InterruptThenAnswer(), context, console)
+
+    assert answer == "continue"
+    assert state_path.exists()
+    saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+    assert saved["wizard_resume_section_index"] == 2
+
+
+def test_ask_question_exits_on_second_consecutive_interrupt(tmp_path: Path, monkeypatch) -> None:
+    class AlwaysInterrupt:
+        def ask(self) -> str:
+            raise KeyboardInterrupt
+
+    ticks = iter([10.0, 11.0])
+    monkeypatch.setattr("ansible_config_wizard.engine.monotonic", lambda: next(ticks))
+
+    state_path = tmp_path / "config-wizard-state.yml"
+    context = {
+        "wizard_resume_enabled": True,
+        "wizard_resume_state_path": str(state_path),
+        "wizard_current_section_index": 1,
+    }
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    with pytest.raises(WizardPaused):
+        ask_question(AlwaysInterrupt(), context, console)
+
+    assert state_path.exists()

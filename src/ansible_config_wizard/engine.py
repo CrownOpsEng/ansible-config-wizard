@@ -9,6 +9,7 @@ import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import pexpect
@@ -89,6 +90,83 @@ def load_answers(path: Path | None) -> dict[str, Any]:
         return {}
     with path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle) or {}
+
+
+def is_generated_resume_state(path: Path | None, wizard_state_dir: Path) -> bool:
+    if path is None:
+        return False
+    try:
+        resolved = path.resolve()
+    except FileNotFoundError:
+        return False
+    if resolved.name != "config-wizard-state.yml":
+        return False
+    try:
+        resolved.relative_to(wizard_state_dir)
+    except ValueError:
+        return False
+    return True
+
+
+def latest_resume_state_path(wizard_state_dir: Path) -> Path | None:
+    candidates = [
+        path
+        for path in wizard_state_dir.glob("runs/*/config-wizard-state.yml")
+        if path.is_file()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def current_section_index(context: dict[str, Any]) -> int:
+    return int(context.get("wizard_current_section_index", 0))
+
+
+def write_resume_state(context: dict[str, Any], section_index: int | None = None) -> Path:
+    path = Path(context["wizard_resume_state_path"])
+    ensure_private_dir(path.parent)
+    snapshot = copy.deepcopy(context)
+    snapshot["wizard_resume_enabled"] = True
+    snapshot["wizard_resume_state"] = True
+    snapshot["wizard_resume_section_index"] = current_section_index(context) if section_index is None else section_index
+    atomic_write(path, yaml.safe_dump(snapshot, sort_keys=False), 0o600)
+    return path
+
+
+def persist_progress(context: dict[str, Any], section_index: int | None = None) -> Path | None:
+    if not context.get("wizard_resume_enabled"):
+        return None
+    return write_resume_state(context, section_index)
+
+
+def exit_on_interrupt(context: dict[str, Any], console: Console) -> None:
+    resume_state_path = persist_progress(context)
+    console.print()
+    if resume_state_path is not None:
+        console.print(f"[yellow]Progress saved to:[/yellow] [bold]{resume_state_path}[/bold]")
+        console.print(f"[yellow]Resume later with:[/yellow] [bold]--answers-file {resume_state_path}[/bold]")
+    raise WizardPaused("Wizard interrupted by operator.")
+
+
+def ask_question(prompt: Any, context: dict[str, Any], console: Console) -> Any:
+    while True:
+        try:
+            value = prompt.ask()
+        except KeyboardInterrupt:
+            interrupted_at = monotonic()
+            last_interrupt = float(context.get("wizard_last_interrupt_at", 0.0))
+            if interrupted_at - last_interrupt <= 2.5:
+                exit_on_interrupt(context, console)
+            resume_state_path = persist_progress(context)
+            console.print()
+            if resume_state_path is not None:
+                console.print(f"[yellow]Progress saved to:[/yellow] [bold]{resume_state_path}[/bold]")
+            console.print("[yellow]Press Ctrl-C again to exit, or continue with this step.[/yellow]")
+            context["wizard_last_interrupt_at"] = interrupted_at
+            continue
+        context["wizard_last_interrupt_at"] = 0.0
+        return value
 
 
 def evaluate_ast_expression(node: ast.AST, context: dict[str, Any]) -> Any:
@@ -177,14 +255,18 @@ def normalize_value(field: FieldModel, value: Any) -> Any:
     return value
 
 
-def prompt_key_value(field: FieldModel, default: dict[str, str] | None, console: Console) -> dict[str, str]:
+def prompt_key_value(field: FieldModel, default: dict[str, str] | None, console: Console, context: dict[str, Any]) -> dict[str, str]:
     default = copy.deepcopy(default or {})
     console.print()
     if default:
-        use_default = questionary.confirm(
-            f"{field.label}: keep existing/default key-value entries?",
-            default=True,
-        ).ask()
+        use_default = ask_question(
+            questionary.confirm(
+                f"{field.label}: keep existing/default key-value entries?",
+                default=True,
+            ),
+            context,
+            console,
+        )
         if use_default:
             return default
 
@@ -192,15 +274,19 @@ def prompt_key_value(field: FieldModel, default: dict[str, str] | None, console:
     console.print(f"[bold]{field.label}[/bold]", style="cyan")
     console.print("Leave the key blank when you are finished.", style="dim")
     while True:
-        key = questionary.text("Key").ask()
+        key = ask_question(questionary.text("Key"), context, console)
         if not key:
             break
-        value = questionary.password("Value").ask() if field.secret else questionary.text("Value").ask()
+        value = (
+            ask_question(questionary.password("Value"), context, console)
+            if field.secret
+            else ask_question(questionary.text("Value"), context, console)
+        )
         result[key] = value or ""
     return result
 
 
-def prompt_field(field: FieldModel, default: Any, console: Console) -> Any:
+def prompt_field(field: FieldModel, default: Any, console: Console, context: dict[str, Any]) -> Any:
     console.print()
     prompt = field.label
     if field.help:
@@ -211,31 +297,31 @@ def prompt_field(field: FieldModel, default: Any, console: Console) -> Any:
         console.print(f"Default: {'yes' if bool(default) else 'no'}", style="dim")
 
     if field.type == "confirm":
-        value = questionary.confirm(prompt, default=bool(default)).ask()
+        value = ask_question(questionary.confirm(prompt, default=bool(default)), context, console)
         console.print()
         return value
     if field.type == "select":
-        value = questionary.select(prompt, choices=field.choices, default=default).ask()
+        value = ask_question(questionary.select(prompt, choices=field.choices, default=default), context, console)
         console.print()
         return value
     if field.type == "password":
-        value = questionary.password(prompt, default=str(default or "")).ask()
+        value = ask_question(questionary.password(prompt, default=str(default or "")), context, console)
         console.print()
         return value
     if field.type == "int":
-        value = int(questionary.text(prompt, default=str(default or 0)).ask())
+        value = int(ask_question(questionary.text(prompt, default=str(default or 0)), context, console))
         console.print()
         return value
     if field.type == "list":
         default_text = ", ".join(default or [])
-        answer = questionary.text(prompt, default=default_text).ask()
+        answer = ask_question(questionary.text(prompt, default=default_text), context, console)
         console.print()
         return normalize_value(field, answer)
     if field.type == "key_value":
-        return prompt_key_value(field, default, console)
+        return prompt_key_value(field, default, console, context)
     if field.type == "ssh_keypair":
         return default
-    value = questionary.text(prompt, default="" if default is None else str(default)).ask()
+    value = ask_question(questionary.text(prompt, default="" if default is None else str(default)), context, console)
     console.print()
     return value
 
@@ -279,15 +365,21 @@ def resolve_field(
     field: FieldModel,
     context: dict[str, Any],
     provided_value: Any,
+    current_value: Any,
     assume_yes: bool,
     console: Console,
     repo_root: Path,
 ) -> Any:
-    default = default_for_field(field, context)
-    if provided_value is not None:
-        return normalize_value(field, provided_value)
+    default = copy.deepcopy(current_value) if current_value is not None else default_for_field(field, context)
+    if current_value is None and provided_value is not None and not assume_yes:
+        default = normalize_value(field, copy.deepcopy(provided_value))
 
     source = field.source
+    if source.kind == "generate" and current_value is not None:
+        return normalize_value(field, copy.deepcopy(current_value))
+    if provided_value is not None and (assume_yes or source.kind == "generate"):
+        return normalize_value(field, copy.deepcopy(provided_value))
+
     if source.kind == "generate":
         generator_params = copy.deepcopy(source.params)
         if field.type == "ssh_keypair":
@@ -313,12 +405,16 @@ def resolve_field(
     if source.kind == "external_vault":
         if assume_yes:
             raise WizardError(f"Missing external vault reference for required field: {field.id}")
-        driver = questionary.select(
-            f"{field.label}: external vault driver",
-            choices=["bitwarden", "1password", "vaultwarden", "aws_secrets_manager", "gcp_secret_manager", "hashicorp_vault"],
-            default="bitwarden",
-        ).ask()
-        reference = questionary.text(f"{field.label}: secret reference or ID").ask()
+        driver = ask_question(
+            questionary.select(
+                f"{field.label}: external vault driver",
+                choices=["bitwarden", "1password", "vaultwarden", "aws_secrets_manager", "gcp_secret_manager", "hashicorp_vault"],
+                default="bitwarden",
+            ),
+            context,
+            console,
+        )
+        reference = ask_question(questionary.text(f"{field.label}: secret reference or ID"), context, console)
         return {"driver": driver, "ref": {"id": reference or ""}}
 
     if assume_yes:
@@ -330,7 +426,7 @@ def resolve_field(
             raise WizardError(f"Missing value for required field: {field.id}")
         return normalize_value(field, default)
 
-    value = prompt_field(field, default, console)
+    value = prompt_field(field, default, console, context)
     if field.required and value in (None, "", [], {}):
         raise WizardError(f"Value required for field: {field.id}")
     return normalize_value(field, value)
@@ -348,13 +444,9 @@ def collect_fields(
     for field in section.fields:
         if not evaluate_condition(field.when, context):
             continue
-        if field.id in answers:
-            provided = answers.get(field.id)
-        elif field.id in answered_fields:
-            provided = copy.deepcopy(context.get(field.id))
-        else:
-            provided = None
-        value = resolve_field(field, context, provided, assume_yes, console, repo_root)
+        provided = answers.get(field.id) if field.id in answers else None
+        current_value = copy.deepcopy(context.get(field.id)) if field.id in context else None
+        value = resolve_field(field, context, provided, current_value, assume_yes, console, repo_root)
         context[field.id] = value
         answered_fields.add(field.id)
 
@@ -369,11 +461,11 @@ def collect_repeatable(
     answered_collections: set[str],
 ) -> None:
     collection_key = section.collection_key or section.id
-    existing_items = copy.deepcopy(context.get(collection_key, [])) if collection_key in answered_collections else []
+    existing_items = copy.deepcopy(context.get(collection_key, []))
     provided_items = answers.get(collection_key) if collection_key in answers else None
     items: list[dict[str, Any]] = []
 
-    if provided_items is not None:
+    if assume_yes and provided_items is not None:
         for index, provided_item in enumerate(provided_items, start=1):
             item_context = copy.deepcopy(context)
             item_context["item_index"] = index
@@ -385,6 +477,7 @@ def collect_repeatable(
                     field,
                     {**item_context, **item},
                     provided_item.get(field.id),
+                    None,
                     assume_yes,
                     console,
                     repo_root,
@@ -399,7 +492,20 @@ def collect_repeatable(
         answered_collections.add(collection_key)
         return
 
-    count_default = max(len(existing_items), section.default_count, section.min_items)
+    seed_items = copy.deepcopy(existing_items)
+    if provided_items is not None:
+        max_seed_len = max(len(seed_items), len(provided_items))
+        while len(seed_items) < max_seed_len:
+            seed_items.append({})
+        for index, provided_item in enumerate(provided_items):
+            if index >= len(seed_items):
+                seed_items.append(copy.deepcopy(provided_item))
+                continue
+            merged = copy.deepcopy(provided_item)
+            merged.update(seed_items[index])
+            seed_items[index] = merged
+
+    count_default = max(len(seed_items), section.default_count, section.min_items)
     if not assume_yes:
         console.print(
             "We'll set these up one at a time so the values stay easy to reason about.",
@@ -418,24 +524,42 @@ def collect_repeatable(
         item_context["item_index"] = index
         item: dict[str, Any] = {}
         existing_item = existing_item or {}
+        provided_item = (
+            provided_items[index - 1]
+            if provided_items is not None and index - 1 < len(provided_items)
+            else {}
+        )
         for field in section.fields:
             if not evaluate_condition(field.when, {**item_context, **item}):
                 continue
-            provided = copy.deepcopy(existing_item.get(field.id)) if field.id in existing_item else None
-            item[field.id] = resolve_field(field, {**item_context, **item}, provided, assume_yes, console, repo_root)
+            provided = copy.deepcopy(provided_item.get(field.id)) if field.id in provided_item else None
+            current_value = copy.deepcopy(existing_item.get(field.id)) if field.id in existing_item else None
+            item[field.id] = resolve_field(
+                field,
+                {**item_context, **item},
+                provided,
+                current_value,
+                assume_yes,
+                console,
+                repo_root,
+            )
         return item
 
     for index in range(1, count_default + 1):
-        existing_item = existing_items[index - 1] if index - 1 < len(existing_items) else {}
+        existing_item = seed_items[index - 1] if index - 1 < len(seed_items) else {}
         items.append(prompt_repeatable_item(index, existing_item))
 
     next_index = count_default + 1
     while not assume_yes:
         console.print()
-        add_another = questionary.confirm(
-            f"Add another {section.item_label}?",
-            default=False,
-        ).ask()
+        add_another = ask_question(
+            questionary.confirm(
+                f"Add another {section.item_label}?",
+                default=False,
+            ),
+            context,
+            console,
+        )
         console.print()
         if not add_another:
             break
@@ -451,13 +575,6 @@ def previous_visible_section_index(sections: list[SectionModel], context: dict[s
         if evaluate_condition(sections[index].when, context):
             return index
     return None
-
-
-def write_resume_state(context: dict[str, Any]) -> Path:
-    path = Path(context["wizard_resume_state_path"])
-    ensure_private_dir(path.parent)
-    atomic_write(path, yaml.safe_dump(context, sort_keys=False), 0o600)
-    return path
 
 
 def write_action_commands(section: SectionModel, commands: str, context: dict[str, Any]) -> Path:
@@ -656,7 +773,7 @@ def render_manual_action_commands(
 
 def pause_wizard(action: ActionModel, context: dict[str, Any], console: Console) -> None:
     resume_state_path = ""
-    if action.save_state:
+    if action.save_state or context.get("wizard_resume_enabled"):
         resume_state_path = str(write_resume_state(context))
         context["resume_state_path"] = resume_state_path
     if resume_state_path:
@@ -699,18 +816,22 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
         if manual_requested:
             render_manual_action_commands(section, commands, context, console)
 
-        choice = questionary.select(
-            action.prompt,
-            choices=[
-                "Install now (recommended)",
-                "Show manual steps",
-                "I already finished this, continue",
-                "Pause here and resume later",
-            ],
-            default="Install now (recommended)",
-        ).ask()
+        choice = ask_question(
+            questionary.select(
+                action.prompt,
+                choices=[
+                    "Install now (recommended)",
+                    "Show manual steps",
+                    "I already finished this, continue",
+                    "Pause here and resume later",
+                ],
+                default="Install now (recommended)",
+            ),
+            context,
+            console,
+        )
         if choice == "Install now (recommended)":
-            password = questionary.password(f"Password for {ssh_user}@{host}").ask()
+            password = ask_question(questionary.password(f"Password for {ssh_user}@{host}"), context, console)
             if not password:
                 console.print("[yellow]No password entered.[/yellow]")
                 continue
@@ -720,15 +841,19 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
             except WizardError as exc:
                 console.print(f"[red]{exc}[/red]")
                 manual_requested = True
-                follow_up = questionary.select(
-                    "The automatic path hit a snag. What do you want to do next?",
-                    choices=[
-                        "Show manual steps",
-                        "Try automatic install again",
-                        "Pause here and resume later",
-                    ],
-                    default="Show manual steps",
-                ).ask()
+                follow_up = ask_question(
+                    questionary.select(
+                        "The automatic path hit a snag. What do you want to do next?",
+                        choices=[
+                            "Show manual steps",
+                            "Try automatic install again",
+                            "Pause here and resume later",
+                        ],
+                        default="Show manual steps",
+                    ),
+                    context,
+                    console,
+                )
                 if follow_up == "Try automatic install again":
                     continue
                 if follow_up == "Pause here and resume later":
@@ -774,11 +899,15 @@ def run_section_actions(
             commands = render_template_string(action.commands_template, context).strip()
             render_manual_action_commands(section, commands, context, console)
 
-        choice = questionary.select(
-            action.prompt,
-            choices=["Continue now", "Exit and resume later"],
-            default="Continue now",
-        ).ask()
+        choice = ask_question(
+            questionary.select(
+                action.prompt,
+                choices=["Continue now", "Exit and resume later"],
+                default="Continue now",
+            ),
+            context,
+            console,
+        )
         if choice == "Exit and resume later":
             pause_wizard(action, context, console)
 
@@ -926,16 +1055,16 @@ def write_audit_log(repo_root: Path, context: dict[str, Any]) -> Path:
 
 
 def cleanup_generated_resume_state(answers_path: Path | None, context: dict[str, Any], console: Console) -> None:
-    if answers_path is None:
-        return
-    resolved_answers = answers_path.resolve()
     wizard_state_dir = Path(context["wizard_state_dir"])
-    if resolved_answers.name != "config-wizard-state.yml":
-        return
-    if not resolved_answers.is_relative_to(wizard_state_dir):
-        return
-    secure_delete(resolved_answers)
-    console.print(f"[cyan]Deleted[/cyan] {resolved_answers}")
+    candidates: set[Path] = set()
+    if answers_path is not None and is_generated_resume_state(answers_path, wizard_state_dir):
+        candidates.add(answers_path.resolve())
+    current_resume = Path(context["wizard_resume_state_path"])
+    if current_resume.exists() and is_generated_resume_state(current_resume, wizard_state_dir):
+        candidates.add(current_resume.resolve())
+    for candidate in sorted(candidates):
+        secure_delete(candidate)
+        console.print(f"[cyan]Deleted[/cyan] {candidate}")
 
 
 def encrypt_vault_file(repo_root: Path, vault_password_file: str | None, console: Console) -> None:
@@ -962,17 +1091,60 @@ def maybe_prompt_option(
     prompt: str,
     default: bool,
     assume_yes: bool,
+    context: dict[str, Any],
+    console: Console,
 ) -> bool:
     if key in answers:
         return bool(answers[key])
     if assume_yes:
         return default
-    return bool(questionary.confirm(prompt, default=default).ask())
+    return bool(ask_question(questionary.confirm(prompt, default=default), context, console))
 
 
 def explain_next_choice(console: Console, title: str, body: str) -> None:
     console.print(f"[bold]{title}[/bold]", style="cyan")
     console.print(body, style="dim")
+
+
+def choose_startup_answers_path(
+    explicit_answers_path: Path | None,
+    context: dict[str, Any],
+    assume_yes: bool,
+    console: Console,
+) -> tuple[Path | None, bool]:
+    wizard_state_dir = Path(context["wizard_state_dir"])
+    if explicit_answers_path is not None:
+        return explicit_answers_path, is_generated_resume_state(explicit_answers_path, wizard_state_dir)
+    if assume_yes:
+        return None, False
+
+    latest_resume = latest_resume_state_path(wizard_state_dir)
+    if latest_resume is None:
+        return None, False
+
+    console.print()
+    console.print("[bold]Previous run found[/bold]", style="cyan")
+    console.print(
+        f"A saved wizard run is available at {latest_resume}. You can resume it or start fresh.",
+        style="dim",
+    )
+    console.print()
+    choice = ask_question(
+        questionary.select(
+            "How do you want to start?",
+            choices=[
+                "Resume the last run",
+                "Start fresh",
+            ],
+            default="Resume the last run",
+        ),
+        context,
+        console,
+    )
+    console.print()
+    if choice == "Resume the last run":
+        return latest_resume, True
+    return None, False
 
 
 def run_wizard(
@@ -987,11 +1159,11 @@ def run_wizard(
     profile = load_profile(profile_path)
     template_root = profile_path.parent.parent
     builder = resolve_builder(profile.builder, repo_root=repo_root, profile_root=template_root)
-    provided_answers = load_answers(answers_path)
     context: dict[str, Any] = copy.deepcopy(profile.defaults)
     context["profile_id"] = profile.id
     context["timestamp"] = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     context["repo_root"] = str(repo_root)
+    context["wizard_last_interrupt_at"] = 0.0
     state_home = default_state_home()
     context["wizard_state_home"] = str(state_home)
     context["wizard_state_dir"] = str(
@@ -1004,13 +1176,42 @@ def run_wizard(
         ensure_private_dir(Path(context["wizard_state_dir"]) / "runs" / context["timestamp"])
     )
     context["wizard_resume_state_path"] = str(Path(context["wizard_run_dir"]) / "config-wizard-state.yml")
+    selected_answers_path, is_resume_state = choose_startup_answers_path(answers_path, context, assume_yes, console)
+    loaded_answers = load_answers(selected_answers_path)
+    if is_resume_state:
+        context.update(loaded_answers)
+        provided_answers: dict[str, Any] = {}
+    else:
+        provided_answers = loaded_answers
+    if "wizard_last_interrupt_at" not in context:
+        context["wizard_last_interrupt_at"] = 0.0
+    if assume_yes:
+        context["wizard_resume_enabled"] = bool(context.get("wizard_resume_enabled", False))
+    elif is_resume_state:
+        context["wizard_resume_enabled"] = True
+    else:
+        console.print()
+        explain_next_choice(
+            console,
+            "Resumable run",
+            "The wizard can save progress after each section so you can safely pause, recover from interrupts, or pick up later without retyping everything.",
+        )
+        context["wizard_resume_enabled"] = bool(
+            ask_question(
+                questionary.confirm("Keep this run resumable while you work?", default=True),
+                context,
+                console,
+            )
+        )
+        console.print()
     answered_fields: set[str] = set()
     answered_collections: set[str] = set()
 
     render_welcome(console, profile, assume_yes)
 
-    section_index = 0
+    section_index = int(context.get("wizard_resume_section_index", 0))
     while section_index < len(profile.sections):
+        context["wizard_current_section_index"] = section_index
         section = profile.sections[section_index]
         if not evaluate_condition(section.when, context):
             section_index += 1
@@ -1032,6 +1233,8 @@ def run_wizard(
             )
         run_section_actions(section, context, repo_root, assume_yes, console)
 
+        persist_progress(context, section_index + 1)
+
         if assume_yes:
             section_index += 1
             continue
@@ -1040,11 +1243,15 @@ def run_wizard(
         if previous_visible_section_index(profile.sections, context, section_index) is not None:
             nav_choices.append("Go back")
         console.print()
-        navigation = questionary.select(
-            "Ready for the next step?",
-            choices=nav_choices,
-            default="Continue",
-        ).ask()
+        navigation = ask_question(
+            questionary.select(
+                "Ready for the next step?",
+                choices=nav_choices,
+                default="Continue",
+            ),
+            context,
+            console,
+        )
         console.print()
         if navigation == "Go back":
             previous_index = previous_visible_section_index(profile.sections, context, section_index)
@@ -1058,7 +1265,15 @@ def run_wizard(
         "Optional record file",
         "A private details file can capture setup notes and, if you choose, raw secrets for handoff or safekeeping.",
     )
-    write_details = maybe_prompt_option(provided_answers, "write_details", "Write sensitive details file?", False, assume_yes)
+    write_details = maybe_prompt_option(
+        provided_answers,
+        "write_details",
+        "Write sensitive details file?",
+        False,
+        assume_yes,
+        context,
+        console,
+    )
     include_secret_details = False
     if write_details:
         explain_next_choice(
@@ -1072,13 +1287,23 @@ def run_wizard(
             "Include raw secret values in the details file?",
             False,
             assume_yes,
+            context,
+            console,
         )
     explain_next_choice(
         console,
         "Optional audit log",
         "The audit log records what the wizard did without storing raw secrets. It is useful for traceability and reruns.",
     )
-    write_log = maybe_prompt_option(provided_answers, "write_log", "Write sanitized audit log?", False, assume_yes)
+    write_log = maybe_prompt_option(
+        provided_answers,
+        "write_log",
+        "Write sanitized audit log?",
+        False,
+        assume_yes,
+        context,
+        console,
+    )
 
     context["write_details"] = write_details
     context["include_secret_details"] = include_secret_details
@@ -1115,6 +1340,8 @@ def run_wizard(
         "Encrypt inventories/prod/group_vars/vault.yml now?",
         True,
         assume_yes,
+        context,
+        console,
     )
     if encrypt_vault:
         vault_password_file = provided_answers.get("vault_password_file")
@@ -1131,11 +1358,13 @@ def run_wizard(
         "Run preflight now?",
         False,
         assume_yes,
+        context,
+        console,
     )
     if run_preflight_now:
         run_preflight(repo_root, console)
 
-    cleanup_generated_resume_state(answers_path, built, console)
+    cleanup_generated_resume_state(selected_answers_path, built, console)
 
     console.print(
         Panel(
