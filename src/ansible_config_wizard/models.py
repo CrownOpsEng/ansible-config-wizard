@@ -52,6 +52,7 @@ class ActionModel(BaseModel):
         default_factory=lambda: ["show", "run", "leave"]
     )
     default_choice: Literal["show", "run", "leave"] = "show"
+    write_command_file: bool = False
     save_state: bool = False
     collection_key: str | None = None
     working_directory_template: str | None = None

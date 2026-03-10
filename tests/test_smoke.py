@@ -21,6 +21,7 @@ from ansible_config_wizard.engine import (
     describe_step_target,
     evaluate_condition,
     furthest_resume_index,
+    install_ssh_key_with_password,
     latest_resume_state_path,
     local_command_choice_default,
     local_command_choice_labels,
@@ -126,6 +127,36 @@ def test_local_command_action_exposes_profile_defined_choices() -> None:
 
     assert local_command_choice_labels(action) == ["Run now", "Leave for later"]
     assert local_command_choice_default(action) == "Run now"
+
+
+def test_local_command_actions_do_not_write_command_files_by_default() -> None:
+    action = ActionModel(
+        kind="local_command",
+        message_template="Hello",
+        command_template="echo hi",
+    )
+
+    assert action.write_command_file is False
+
+
+def test_install_ssh_key_with_password_rejects_unknown_host_trust(monkeypatch) -> None:
+    class FakeSpawn:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.before = ""
+            self.exitstatus = 255
+            self.logfile_read = None
+
+        def expect(self, _patterns) -> int:
+            return 0
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr("ansible_config_wizard.engine.pexpect.spawn", FakeSpawn)
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    with pytest.raises(WizardError, match="host key is not trusted locally yet"):
+        install_ssh_key_with_password("203.0.113.10", "ubuntu", "/tmp/test.pub", "secret", console)
 
 
 def test_build_ssh_setup_commands_disables_agent_keys() -> None:

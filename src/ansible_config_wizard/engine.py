@@ -985,8 +985,10 @@ def install_ssh_key_with_password(
             )
             output += child.before
             if index == 0:
-                child.sendline("yes")
-                continue
+                raise WizardError(
+                    "Automatic SSH key install stopped because the server host key is not trusted locally yet. "
+                    "Verify the host key first, then retry the automatic path or use the manual steps."
+                )
             if index == 1:
                 password_prompts += 1
                 if password_prompts > 3:
@@ -1228,7 +1230,7 @@ def run_local_command_action(
     working_directory = None
     if action.working_directory_template:
         working_directory = Path(render_template_string(action.working_directory_template, action_context))
-    command_path = write_command_file(action_name, command, action_context) if command else None
+    command_path: Path | None = None
 
     show_manual = False
     while True:
@@ -1243,6 +1245,10 @@ def run_local_command_action(
             style="dim",
         )
         if show_manual and command:
+            if action.write_command_file and command_path is None:
+                command_path = write_command_file(action_name, command, action_context)
+                console.print()
+                console.print(f"[cyan]Prepared command file[/cyan] {command_path}")
             console.print()
             console.print("[cyan]Follow-up command[/cyan]")
             console.print(command, markup=False, highlight=False, no_wrap=True, overflow="ignore")
