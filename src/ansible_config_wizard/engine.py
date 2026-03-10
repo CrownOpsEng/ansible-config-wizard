@@ -1197,6 +1197,21 @@ def run_local_command(command: str, working_directory: Path | None, console: Con
     )
 
 
+LOCAL_COMMAND_LABELS = {
+    "show": "Show command",
+    "run": "Run now",
+    "leave": "Leave for later",
+}
+
+
+def local_command_choice_labels(action: ActionModel) -> list[str]:
+    return [LOCAL_COMMAND_LABELS[name] for name in action.available_choices]
+
+
+def local_command_choice_default(action: ActionModel) -> str:
+    return LOCAL_COMMAND_LABELS[action.default_choice]
+
+
 def run_local_command_action(
     action: ActionModel,
     context: dict[str, Any],
@@ -1236,12 +1251,8 @@ def run_local_command_action(
         choice = ask_question(
             questionary.select(
                 action.prompt,
-                choices=[
-                    "Show command",
-                    "Run now",
-                    "Leave for later",
-                ],
-                default="Show command",
+                choices=local_command_choice_labels(action),
+                default=local_command_choice_default(action),
             ),
             context,
             console,

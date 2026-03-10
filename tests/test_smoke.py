@@ -22,13 +22,15 @@ from ansible_config_wizard.engine import (
     evaluate_condition,
     furthest_resume_index,
     latest_resume_state_path,
+    local_command_choice_default,
+    local_command_choice_labels,
     next_navigation_choices,
     persist_progress,
     previous_visible_section_index,
     resolve_field,
     run_wizard,
 )
-from ansible_config_wizard.models import FieldModel, SectionModel
+from ansible_config_wizard.models import ActionModel, FieldModel, SectionModel
 
 
 class Buffer:
@@ -95,6 +97,35 @@ def test_evaluate_condition_rejects_unsafe_code() -> None:
 
 def test_evaluate_condition_supports_attribute_access_for_dicts() -> None:
     assert evaluate_condition("action_item.bootstrap_enabled", {"action_item": {"bootstrap_enabled": True}})
+
+
+def test_local_command_action_requires_command_template() -> None:
+    with pytest.raises(ValueError, match="command_template"):
+        ActionModel(kind="local_command", message_template="Hello")
+
+
+def test_local_command_action_default_choice_must_be_available() -> None:
+    with pytest.raises(ValueError, match="default_choice"):
+        ActionModel(
+            kind="local_command",
+            message_template="Hello",
+            command_template="echo hi",
+            available_choices=["show", "leave"],
+            default_choice="run",
+        )
+
+
+def test_local_command_action_exposes_profile_defined_choices() -> None:
+    action = ActionModel(
+        kind="local_command",
+        message_template="Hello",
+        command_template="echo hi",
+        available_choices=["run", "leave"],
+        default_choice="run",
+    )
+
+    assert local_command_choice_labels(action) == ["Run now", "Leave for later"]
+    assert local_command_choice_default(action) == "Run now"
 
 
 def test_build_ssh_setup_commands_disables_agent_keys() -> None:

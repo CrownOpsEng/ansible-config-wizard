@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SourceModel(BaseModel):
@@ -48,6 +48,10 @@ class ActionModel(BaseModel):
     commands_template: str | None = None
     command_template: str | None = None
     prompt: str = "Continue after completing this step?"
+    available_choices: list[Literal["show", "run", "leave"]] = Field(
+        default_factory=lambda: ["show", "run", "leave"]
+    )
+    default_choice: Literal["show", "run", "leave"] = "show"
     save_state: bool = False
     collection_key: str | None = None
     working_directory_template: str | None = None
@@ -55,6 +59,16 @@ class ActionModel(BaseModel):
     ssh_user_template: str | None = None
     public_key_path_template: str | None = None
     private_key_path_template: str | None = None
+
+    @model_validator(mode="after")
+    def validate_action(self) -> "ActionModel":
+        if self.kind == "local_command" and not self.command_template:
+            raise ValueError("local_command actions require command_template")
+        if not self.available_choices:
+            raise ValueError("available_choices must not be empty")
+        if self.default_choice not in self.available_choices:
+            raise ValueError("default_choice must be included in available_choices")
+        return self
 
 
 class OutputModel(BaseModel):
