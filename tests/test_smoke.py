@@ -36,6 +36,7 @@ from ansible_config_wizard.engine import (
     review_boundary_index,
     run_preflight,
     run_wizard,
+    sanitize_for_log,
     stage_heading,
     stage_label,
     stage_menu_choices,
@@ -788,3 +789,29 @@ def test_full_interactive_workflow_runs_command_and_manual_stages(monkeypatch, t
     run_wizard(profile_path=profile_path, repo_root=repo_root)
 
     assert ["echo", "prepare"] in executed
+
+
+def test_sanitize_for_log_keeps_nested_feature_and_host_contracts_generic() -> None:
+    sanitized = sanitize_for_log(
+        {
+            "host_name": "core-01",
+            "base_domain": "example.com",
+            "ops_domain": "ops.example.com",
+            "features": {
+                "obsidian_livesync": {
+                    "enabled": True,
+                    "access_mode": "private_mesh",
+                }
+            },
+            "host": {
+                "restic": {
+                    "enabled": True,
+                    "targets": [{"name": "primary"}],
+                }
+            },
+            "tailscale_hostname": "core-01",
+        }
+    )
+
+    assert sanitized["features"]["obsidian_livesync"]["access_mode"] == "private_mesh"
+    assert sanitized["host"]["restic"]["targets"][0]["name"] == "primary"
