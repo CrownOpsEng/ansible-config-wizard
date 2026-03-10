@@ -30,8 +30,10 @@ from ansible_config_wizard.engine import (
     local_command_choice_labels,
     local_command_menu_default,
     local_command_menu_labels,
+    maybe_prompt_runtime_option,
     next_navigation_choices,
     persist_progress,
+    prompt_for_vault_authentication,
     previous_visible_section_index,
     resolve_field,
     resolve_local_command_options,
@@ -134,6 +136,25 @@ def test_ensure_vault_password_file_creates_private_file(tmp_path: Path) -> None
     assert password_file.exists()
     assert password_file.stat().st_mode & 0o777 == 0o600
     assert len(password_file.read_text(encoding="utf-8").strip()) == 48
+
+
+def test_prompt_for_vault_authentication_can_choose_interactive_prompt(monkeypatch, tmp_path: Path) -> None:
+    answers = iter(["Prompt for vault password interactively"])
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda *_args, **_kwargs: next(answers))
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    result = prompt_for_vault_authentication(tmp_path, None, {}, console)
+
+    assert result is None
+
+
+def test_maybe_prompt_runtime_option_ignores_seeded_answers_interactively(monkeypatch) -> None:
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda *_args, **_kwargs: True)
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    result = maybe_prompt_runtime_option({"encrypt_vault": False}, "encrypt_vault", "Encrypt now?", False, False, {}, console)
+
+    assert result is True
 
 
 def test_run_preflight_uses_ask_vault_pass_for_encrypted_vault(tmp_path: Path, monkeypatch) -> None:

@@ -1877,6 +1877,35 @@ def prompt_for_vault_password_file(
     return resolve_vault_password_file(repo_root, value.strip())
 
 
+def prompt_for_vault_authentication(
+    repo_root: Path,
+    prompt_default: Path | None,
+    context: dict[str, Any],
+    console: Console,
+) -> Path | None:
+    console.print()
+    console.print(
+        "Ansible needs vault access for this step. Choose whether to prompt for the vault password now or use a local password file.",
+        style="dim",
+    )
+    choice = ask_question(
+        questionary.select(
+            "How should Ansible unlock vault.yml?",
+            choices=[
+                "Prompt for vault password interactively",
+                "Use vault password file",
+            ],
+            default="Prompt for vault password interactively",
+        ),
+        context,
+        console,
+    )
+    console.print()
+    if choice == "Prompt for vault password interactively":
+        return None
+    return prompt_for_vault_password_file(repo_root, prompt_default, context, console)
+
+
 def finalize_vault_password_file(
     repo_root: Path,
     current_value: str | Path | None,
@@ -1906,7 +1935,12 @@ def finalize_vault_password_file(
             )
         return None
 
-    return prompt_for_vault_password_file(repo_root, configured_vault_password_file_path(repo_root), context, console)
+    return prompt_for_vault_authentication(
+        repo_root,
+        configured_vault_password_file_path(repo_root),
+        context,
+        console,
+    )
 
 
 def preflight_vault_args(repo_root: Path, vault_password_file: Path | None) -> list[str]:
@@ -1948,6 +1982,22 @@ def maybe_prompt_option(
     console: Console,
 ) -> bool:
     if key in answers:
+        return bool(answers[key])
+    if assume_yes:
+        return default
+    return bool(ask_question(questionary.confirm(prompt, default=default), context, console))
+
+
+def maybe_prompt_runtime_option(
+    answers: dict[str, Any],
+    key: str,
+    prompt: str,
+    default: bool,
+    assume_yes: bool,
+    context: dict[str, Any],
+    console: Console,
+) -> bool:
+    if assume_yes and key in answers:
         return bool(answers[key])
     if assume_yes:
         return default
@@ -2139,7 +2189,7 @@ def run_wizard(
         "Optional record file",
         "A private details file can capture setup notes and, if you choose, raw secrets for handoff or safekeeping.",
     )
-    write_details = maybe_prompt_option(
+    write_details = maybe_prompt_runtime_option(
         provided_answers,
         "write_details",
         "Write sensitive details file?",
@@ -2155,7 +2205,7 @@ def run_wizard(
             "Raw secrets in the record file",
             "Including raw secrets makes handoff easier, but it also creates another sensitive file to protect or delete afterward.",
         )
-        include_secret_details = maybe_prompt_option(
+        include_secret_details = maybe_prompt_runtime_option(
             provided_answers,
             "include_secret_details",
             "Include raw secret values in the details file?",
@@ -2169,7 +2219,7 @@ def run_wizard(
         "Optional audit log",
         "The audit log records what the wizard did without storing raw secrets. It is useful for traceability and reruns.",
     )
-    write_log = maybe_prompt_option(
+    write_log = maybe_prompt_runtime_option(
         provided_answers,
         "write_log",
         "Write sanitized audit log?",
@@ -2188,6 +2238,7 @@ def run_wizard(
     built["write_details"] = write_details
     built["include_secret_details"] = include_secret_details
 
+    vault_was_encrypted = is_ansible_vault_file(inventory_vault_path(repo_root))
     rendered_outputs = render_outputs(profile, built, template_root)
     render_review_summary(console, built, rendered_outputs, repo_root)
     for output, _ in rendered_outputs:
@@ -2208,12 +2259,22 @@ def run_wizard(
     explain_next_choice(
         console,
         "Vault encryption",
-        "If you encrypt vault.yml now, the secret file is protected before any real deployment steps begin.",
+        (
+            "The wizard has just regenerated vault.yml from the current answers. "
+            "Encrypting it now restores Ansible Vault protection before any real deployment steps begin."
+            if vault_was_encrypted
+            else "If you encrypt vault.yml now, the secret file is protected before any real deployment steps begin."
+        ),
     )
-    encrypt_vault = encrypt_override if encrypt_override is not None else maybe_prompt_option(
+    encrypt_prompt = (
+        "Encrypt or re-encrypt inventories/prod/group_vars/vault.yml now?"
+        if vault_was_encrypted
+        else "Encrypt inventories/prod/group_vars/vault.yml now?"
+    )
+    encrypt_vault = encrypt_override if encrypt_override is not None else maybe_prompt_runtime_option(
         provided_answers,
         "encrypt_vault",
-        "Encrypt inventories/prod/group_vars/vault.yml now?",
+        encrypt_prompt,
         True,
         assume_yes,
         context,
@@ -2224,7 +2285,7 @@ def run_wizard(
         "Preflight validation",
         "Preflight checks the generated inventory for missing values, risky combinations, and obvious deployment blockers before you touch the host.",
     )
-    run_preflight_now = preflight_override if preflight_override is not None else maybe_prompt_option(
+    run_preflight_now = preflight_override if preflight_override is not None else maybe_prompt_runtime_option(
         provided_answers,
         "run_preflight",
         "Run preflight now?",
@@ -2254,7 +2315,7 @@ def run_wizard(
             "A managed vault password file lets deploy and preflight reuse the same local secret without extra prompts. "
             "The file is stored at the repo's configured default path with 0600 permissions.",
         )
-        create_vault_password_file = maybe_prompt_option(
+        create_vault_password_file = maybe_prompt_runtime_option(
             provided_answers,
             "create_vault_password_file",
             f"Create the default vault password file at {display_path(configured_password_path, repo_root)}?",
