@@ -15,7 +15,7 @@ class SourceModel(BaseModel):
 class FieldModel(BaseModel):
     id: str
     label: str
-    type: Literal["text", "password", "confirm", "select", "list", "key_value", "int", "ssh_keypair"] = "text"
+    type: Literal["text", "multiline_text", "password", "confirm", "select", "list", "key_value", "int", "ssh_keypair"] = "text"
     help: str | None = None
     required: bool = False
     secret: bool = False

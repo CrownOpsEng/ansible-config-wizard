@@ -325,6 +325,14 @@ def text_like_question(
     kwargs = {"key_bindings": build_restore_default_bindings(restore_value)}
     if field_type == "password":
         return questionary.password(prompt, default=default_value, **kwargs)
+    if field_type == "multiline_text":
+        return questionary.text(
+            prompt,
+            default=default_value,
+            multiline=True,
+            instruction="Paste one line per entry. Esc restores the default buffer.",
+            **kwargs,
+        )
     return questionary.text(prompt, default=default_value, **kwargs)
 
 
@@ -359,6 +367,19 @@ def prompt_field(
                 prompt,
                 str(prompt_default or ""),
                 str(display_default or ""),
+            ),
+            context,
+            console,
+        )
+        console.print()
+        return value
+    if field.type == "multiline_text":
+        value = ask_question(
+            text_like_question(
+                field.type,
+                prompt,
+                "" if prompt_default is None else str(prompt_default),
+                "" if display_default is None else str(display_default),
             ),
             context,
             console,
