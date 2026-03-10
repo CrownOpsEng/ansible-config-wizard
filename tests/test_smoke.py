@@ -25,6 +25,8 @@ from ansible_config_wizard.engine import (
     latest_resume_state_path,
     local_command_choice_default,
     local_command_choice_labels,
+    local_command_menu_default,
+    local_command_menu_labels,
     next_navigation_choices,
     persist_progress,
     previous_visible_section_index,
@@ -168,6 +170,27 @@ def test_local_command_action_rejects_mixed_single_and_multi_command_config() ->
             command_template="echo hi",
             command_options=[LocalCommandOptionModel(id="deploy", label="Run deployment", command_template="./scripts/deploy.sh")],
         )
+
+
+def test_local_command_menu_expands_run_choice_into_top_level_options() -> None:
+    action = ActionModel(
+        kind="local_command",
+        message_template="Hello",
+        command_options=[
+            LocalCommandOptionModel(id="deploy", label="Run deployment", command_template="./scripts/deploy.sh"),
+            LocalCommandOptionModel(id="prep", label="Set up prerequisites", command_template="./scripts/setup-prerequisites.sh"),
+        ],
+        default_choice="run",
+    )
+    options = resolve_local_command_options(action, {})
+
+    assert local_command_menu_labels(action, options) == [
+        "Show commands",
+        "Run deployment",
+        "Set up prerequisites",
+        "Leave for later",
+    ]
+    assert local_command_menu_default(action, options) == "Run deployment"
 
 
 def test_install_ssh_key_with_password_rejects_unknown_host_trust(monkeypatch) -> None:

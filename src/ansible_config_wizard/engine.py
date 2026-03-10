@@ -1431,6 +1431,31 @@ def local_command_choice_default(action: ActionModel) -> str:
     return LOCAL_COMMAND_LABELS[action.default_choice]
 
 
+def local_command_menu_labels(action: ActionModel, options: list[dict[str, Any]]) -> list[str]:
+    if len(options) <= 1:
+        return local_command_choice_labels(action)
+
+    labels: list[str] = []
+    for choice_name in action.available_choices:
+        if choice_name == "show":
+            labels.append("Show commands")
+        elif choice_name == "run":
+            labels.extend(option["label"] for option in options)
+        elif choice_name == "leave":
+            labels.append("Leave for later")
+    return labels
+
+
+def local_command_menu_default(action: ActionModel, options: list[dict[str, Any]]) -> str:
+    if len(options) <= 1:
+        return local_command_choice_default(action)
+    if action.default_choice == "run":
+        return options[0]["label"]
+    if action.default_choice == "show":
+        return "Show commands"
+    return "Leave for later"
+
+
 def resolve_local_command_options(
     action: ActionModel,
     action_context: dict[str, Any],
@@ -1485,34 +1510,6 @@ def render_local_command_manual(options: list[dict[str, Any]]) -> str:
     return "\n\n".join(sections)
 
 
-def choose_local_command_option(
-    options: list[dict[str, Any]],
-    context: dict[str, Any],
-    console: Console,
-) -> dict[str, Any]:
-    if len(options) == 1:
-        return options[0]
-
-    console.print("[cyan]Available follow-up actions[/cyan]")
-    for option in options:
-        line = f"- {option['label']}"
-        if option["description"]:
-            line += f": {option['description']}"
-        console.print(line, highlight=False)
-    console.print()
-
-    selected_label = ask_question(
-        questionary.select(
-            "Which follow-up action should run now?",
-            choices=[option["label"] for option in options],
-            default=options[0]["label"],
-        ),
-        context,
-        console,
-    )
-    return next(option for option in options if option["label"] == selected_label)
-
-
 def run_local_command_action(
     action: ActionModel,
     context: dict[str, Any],
@@ -1541,6 +1538,14 @@ def run_local_command_action(
             console.print()
         summary = "The wizard has prepared next-step command options." if len(options) > 1 else "The wizard has prepared the next-step command."
         console.print(f"{summary} You can inspect it now, run it immediately, or leave it for later.", style="dim")
+        if len(options) > 1:
+            console.print("[cyan]Available follow-up actions[/cyan]")
+            for option in options:
+                line = f"- {option['label']}"
+                if option["description"]:
+                    line += f": {option['description']}"
+                console.print(line, highlight=False)
+            console.print()
         if show_manual and manual_commands:
             if action.write_command_file and command_path is None:
                 command_path = write_command_file(action_name, manual_commands, action_context)
@@ -1554,19 +1559,19 @@ def run_local_command_action(
         choice = ask_question(
             questionary.select(
                 action.prompt,
-                choices=local_command_choice_labels(action),
-                default=local_command_choice_default(action),
+                choices=local_command_menu_labels(action, options),
+                default=local_command_menu_default(action, options),
             ),
             context,
             console,
         )
         console.print()
-        if choice == "Show command":
+        if choice in {"Show command", "Show commands"}:
             show_manual = True
             continue
         if choice == "Leave for later":
             return
-        selected = choose_local_command_option(options, context, console)
+        selected = next((option for option in options if option["label"] == choice), options[0])
         try:
             run_local_command(selected["command"], selected["working_directory"], console)
         except subprocess.CalledProcessError as exc:
