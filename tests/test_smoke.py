@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -43,6 +44,7 @@ from ansible_config_wizard.engine import (
     stage_state,
     trusted_local_known_hosts_entries,
     visible_stages,
+    write_audit_log,
 )
 from ansible_config_wizard.models import (
     ActionModel,
@@ -801,12 +803,22 @@ def test_sanitize_for_log_keeps_nested_feature_and_host_contracts_generic() -> N
                 "obsidian_livesync": {
                     "enabled": True,
                     "access_mode": "private_mesh",
+                    "bootstrap_secret": "super-secret",
                 }
             },
             "host": {
                 "restic": {
                     "enabled": True,
-                    "targets": [{"name": "primary"}],
+                    "targets": [
+                        {
+                            "name": "primary",
+                            "password": "target-password",
+                            "ssh_private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n-----END OPENSSH PRIVATE KEY-----",
+                            "environment": {
+                                "CF_DNS_API_TOKEN": "dns-token",
+                            },
+                        }
+                    ],
                 }
             },
             "tailscale_hostname": "core-01",
@@ -815,3 +827,37 @@ def test_sanitize_for_log_keeps_nested_feature_and_host_contracts_generic() -> N
 
     assert sanitized["features"]["obsidian_livesync"]["access_mode"] == "private_mesh"
     assert sanitized["host"]["restic"]["targets"][0]["name"] == "primary"
+    assert sanitized["features"]["obsidian_livesync"]["bootstrap_secret"] == "[redacted]"
+    assert sanitized["host"]["restic"]["targets"][0]["password"] == "[redacted]"
+    assert sanitized["host"]["restic"]["targets"][0]["ssh_private_key"] == "[redacted]"
+    assert sanitized["host"]["restic"]["targets"][0]["environment"]["CF_DNS_API_TOKEN"] == "[redacted]"
+
+
+def test_write_audit_log_redacts_nested_contract_secrets(tmp_path: Path) -> None:
+    audit_path = write_audit_log(
+        repo_root=tmp_path,
+        context={
+            "wizard_run_dir": str(tmp_path / "run"),
+            "timestamp": "2026-03-10T00:00:00Z",
+            "profile_id": "demo",
+            "host_name": "core-01",
+            "features": {
+                "obsidian_livesync": {
+                    "enabled": True,
+                    "setup_uri_passphrase": "very-secret",
+                }
+            },
+            "host": {
+                "restic": {
+                    "enabled": True,
+                    "targets": [{"name": "primary", "password": "also-secret"}],
+                }
+            },
+        },
+    )
+
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    summary = payload["summary"]
+
+    assert summary["features"]["obsidian_livesync"]["setup_uri_passphrase"] == "[redacted]"
+    assert summary["host"]["restic"]["targets"][0]["password"] == "[redacted]"

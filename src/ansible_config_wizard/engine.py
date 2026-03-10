@@ -46,6 +46,21 @@ class WizardPaused(RuntimeError):
     pass
 
 
+SENSITIVE_LOG_KEY_PARTS = (
+    "password",
+    "passphrase",
+    "secret",
+    "token",
+    "private_key",
+    "private-key",
+    "auth_key",
+    "authkey",
+    "api_key",
+    "apikey",
+    "setup_uri",
+)
+
+
 def clear_resume_state(context: dict[str, Any], console: Console) -> None:
     resume_state = context.get("wizard_resume_state_path")
     if not resume_state:
@@ -1815,13 +1830,36 @@ def render_outputs(profile: ProfileModel, context: dict[str, Any], template_root
     return rendered
 
 
+def is_sensitive_log_key(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    return any(part in normalized for part in SENSITIVE_LOG_KEY_PARTS)
+
+
+def sanitize_nested_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if is_sensitive_log_key(str(key)):
+                sanitized[str(key)] = "[redacted]"
+            else:
+                sanitized[str(key)] = sanitize_nested_for_log(item)
+        return sanitized
+    if isinstance(value, list):
+        return [sanitize_nested_for_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_nested_for_log(item) for item in value]
+    if isinstance(value, str) and "BEGIN OPENSSH PRIVATE KEY" in value:
+        return "[redacted]"
+    return value
+
+
 def sanitize_for_log(context: dict[str, Any]) -> dict[str, Any]:
     sanitized = {
         "host_name": context.get("host_name"),
         "base_domain": context.get("base_domain"),
         "ops_domain": context.get("ops_domain"),
-        "features": context.get("features"),
-        "host": context.get("host"),
+        "features": sanitize_nested_for_log(context.get("features")),
+        "host": sanitize_nested_for_log(context.get("host")),
         "tailscale_hostname": context.get("tailscale_hostname"),
         "generated_secret_fingerprints": context.get("generated_secret_fingerprints", []),
         "generated_ssh_public_keys": context.get("generated_ssh_public_keys", []),
