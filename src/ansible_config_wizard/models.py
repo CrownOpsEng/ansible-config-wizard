@@ -42,12 +42,15 @@ class SectionModel(BaseModel):
 
 
 class ActionModel(BaseModel):
-    kind: Literal["pause", "ssh_setup"] = "pause"
+    kind: Literal["pause", "ssh_setup", "local_command"] = "pause"
     when: str | None = None
     message_template: str
     commands_template: str | None = None
+    command_template: str | None = None
     prompt: str = "Continue after completing this step?"
     save_state: bool = False
+    collection_key: str | None = None
+    working_directory_template: str | None = None
     host_template: str | None = None
     ssh_user_template: str | None = None
     public_key_path_template: str | None = None
@@ -69,4 +72,5 @@ class ProfileModel(BaseModel):
     defaults: dict[str, Any] = Field(default_factory=dict)
     startup_fields: list[FieldModel] = Field(default_factory=list)
     sections: list[SectionModel]
+    post_write_actions: list[ActionModel] = Field(default_factory=list)
     outputs: list[OutputModel]

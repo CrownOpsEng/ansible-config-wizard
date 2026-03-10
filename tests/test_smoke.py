@@ -93,6 +93,10 @@ def test_evaluate_condition_rejects_unsafe_code() -> None:
         evaluate_condition("__import__('os').system('true')", {"enabled": True})
 
 
+def test_evaluate_condition_supports_attribute_access_for_dicts() -> None:
+    assert evaluate_condition("action_item.bootstrap_enabled", {"action_item": {"bootstrap_enabled": True}})
+
+
 def test_build_ssh_setup_commands_disables_agent_keys() -> None:
     commands = build_ssh_setup_commands(
         host="203.0.113.10",

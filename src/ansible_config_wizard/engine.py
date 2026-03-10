@@ -194,6 +194,11 @@ def evaluate_ast_expression(node: ast.AST, context: dict[str, Any]) -> Any:
         return evaluate_ast_expression(node.body, context)
     if isinstance(node, ast.Name):
         return context.get(node.id)
+    if isinstance(node, ast.Attribute):
+        base = evaluate_ast_expression(node.value, context)
+        if isinstance(base, dict):
+            return base.get(node.attr)
+        return getattr(base, node.attr, None)
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.List):
@@ -836,11 +841,15 @@ def next_navigation_choices(profile: ProfileModel, context: dict[str, Any], curr
     return choices
 
 
-def write_action_commands(section: SectionModel, commands: str, context: dict[str, Any]) -> Path:
-    path = Path(context["wizard_run_dir"]) / f"{slugify(section.id)}-commands.sh"
+def write_command_file(name: str, commands: str, context: dict[str, Any]) -> Path:
+    path = Path(context["wizard_run_dir"]) / f"{slugify(name)}-commands.sh"
     script = "#!/usr/bin/env bash\nset -euo pipefail\n\n" + commands.strip() + "\n"
     atomic_write(path, script, 0o700)
     return path
+
+
+def write_action_commands(section: SectionModel, commands: str, context: dict[str, Any]) -> Path:
+    return write_command_file(section.id, commands, context)
 
 
 def ssh_command_env() -> dict[str, str]:
@@ -1015,12 +1024,12 @@ def verify_ssh_key_access(host: str, ssh_user: str, private_key_path: str) -> No
 
 
 def render_manual_action_commands(
-    section: SectionModel,
+    action_name: str,
     commands: str,
     context: dict[str, Any],
     console: Console,
 ) -> None:
-    command_path = write_action_commands(section, commands, context)
+    command_path = write_command_file(action_name, commands, context)
     console.print()
     console.print("[cyan]Manual commands file[/cyan]")
     console.print(str(command_path), soft_wrap=True, highlight=False)
@@ -1079,7 +1088,7 @@ def run_ssh_setup_action(action: ActionModel, section: SectionModel, context: di
         )
         console.print()
         if manual_requested:
-            render_manual_action_commands(section, commands, context, console)
+            render_manual_action_commands(section.id, commands, context, console)
 
         choice = ask_question(
             questionary.select(
@@ -1162,7 +1171,7 @@ def run_section_actions(
 
         if action.commands_template:
             commands = render_template_string(action.commands_template, context).strip()
-            render_manual_action_commands(section, commands, context, console)
+            render_manual_action_commands(section.id, commands, context, console)
 
         choice = ask_question(
             questionary.select(
@@ -1175,6 +1184,115 @@ def run_section_actions(
         )
         if choice == "Exit and resume later":
             pause_wizard(action, context, console)
+
+
+def run_local_command(command: str, working_directory: Path | None, console: Console) -> None:
+    console.print("[cyan]Running local command[/cyan]")
+    console.print(command, markup=False, highlight=False, no_wrap=True, overflow="ignore")
+    console.print()
+    subprocess.run(
+        shlex.split(command),
+        check=True,
+        cwd=str(working_directory) if working_directory is not None else None,
+    )
+
+
+def run_local_command_action(
+    action: ActionModel,
+    context: dict[str, Any],
+    console: Console,
+    action_item: Any | None = None,
+) -> None:
+    action_context = copy.deepcopy(context)
+    action_context["action_item"] = action_item
+    action_name = action.collection_key or action.kind
+    if isinstance(action_item, dict) and action_item.get("name"):
+        action_name = f"{action_name}-{action_item['name']}"
+    message = render_template_string(action.message_template, action_context).strip()
+    command = render_template_string(action.command_template, action_context).strip() if action.command_template else ""
+    working_directory = None
+    if action.working_directory_template:
+        working_directory = Path(render_template_string(action.working_directory_template, action_context))
+
+    show_manual = False
+    while True:
+        console.print(Rule("[bold cyan]Optional Setup[/bold cyan]"))
+        console.print(message, soft_wrap=True, highlight=False)
+        console.print()
+        console.print(
+            "Run it now to let Ansible make the remote changes. You can also view the command and handle it later.",
+            style="dim",
+        )
+        if show_manual and command:
+            render_manual_action_commands(action_name, command, action_context, console)
+
+        choice = ask_question(
+            questionary.select(
+                action.prompt,
+                choices=[
+                    "Run now (recommended)",
+                    "Show command",
+                    "Skip for now",
+                ],
+                default="Run now (recommended)",
+            ),
+            context,
+            console,
+        )
+        console.print()
+        if choice == "Show command":
+            show_manual = True
+            continue
+        if choice == "Skip for now":
+            return
+        try:
+            run_local_command(command, working_directory, console)
+        except subprocess.CalledProcessError as exc:
+            console.print(f"[red]Command failed with exit code {exc.returncode}.[/red]")
+            show_manual = True
+            follow_up = ask_question(
+                questionary.select(
+                    "What do you want to do next?",
+                    choices=[
+                        "Show command",
+                        "Try again",
+                        "Skip for now",
+                    ],
+                    default="Show command",
+                ),
+                context,
+                console,
+            )
+            console.print()
+            if follow_up == "Try again":
+                continue
+            if follow_up == "Skip for now":
+                return
+            continue
+        return
+
+
+def run_post_write_actions(
+    profile: ProfileModel,
+    context: dict[str, Any],
+    repo_root: Path,
+    assume_yes: bool,
+    console: Console,
+) -> None:
+    if assume_yes:
+        return
+    for action in profile.post_write_actions:
+        if action.kind != "local_command":
+            continue
+        items = [None]
+        if action.collection_key:
+            items = context.get(action.collection_key, []) or []
+        for action_item in items:
+            action_context = copy.deepcopy(context)
+            action_context["action_item"] = action_item
+            if not evaluate_condition(action.when, action_context):
+                continue
+            run_local_command_action(action, context, console, action_item)
 
 
 def render_welcome(console: Console, profile: ProfileModel, assume_yes: bool) -> None:
@@ -1615,6 +1733,8 @@ def run_wizard(
         target_path = repo_root / render_template_string(output.path, built)
         atomic_write(target_path, content.rstrip() + "\n", int(output.mode, 8))
         console.print(f"[green]Wrote[/green] {display_path(target_path, repo_root)}")
+
+    run_post_write_actions(profile, built, repo_root, assume_yes, console)
 
     log_path = None
     if write_log:
