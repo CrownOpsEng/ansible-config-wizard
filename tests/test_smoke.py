@@ -13,8 +13,10 @@ from ansible_config_wizard.engine import (
     WizardError,
     build_ssh_setup_commands,
     evaluate_condition,
+    previous_visible_section_index,
     run_wizard,
 )
+from ansible_config_wizard.models import SectionModel
 
 
 class Buffer:
@@ -104,3 +106,14 @@ def test_redacting_console_writer_masks_secrets() -> None:
 
     assert "super-secret" not in "".join(output.parts)
     assert "[redacted]" in "".join(output.parts)
+
+
+def test_previous_visible_section_index_skips_hidden_sections() -> None:
+    sections = [
+        SectionModel(id="one", title="One"),
+        SectionModel(id="two", title="Two", when="enabled"),
+        SectionModel(id="three", title="Three"),
+    ]
+
+    assert previous_visible_section_index(sections, {"enabled": False}, 2) == 0
+    assert previous_visible_section_index(sections, {"enabled": True}, 2) == 1

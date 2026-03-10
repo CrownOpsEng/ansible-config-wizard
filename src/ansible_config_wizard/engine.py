@@ -179,6 +179,7 @@ def normalize_value(field: FieldModel, value: Any) -> Any:
 
 def prompt_key_value(field: FieldModel, default: dict[str, str] | None, console: Console) -> dict[str, str]:
     default = copy.deepcopy(default or {})
+    console.print()
     if default:
         use_default = questionary.confirm(
             f"{field.label}: keep existing/default key-value entries?",
@@ -200,6 +201,7 @@ def prompt_key_value(field: FieldModel, default: dict[str, str] | None, console:
 
 
 def prompt_field(field: FieldModel, default: Any, console: Console) -> Any:
+    console.print()
     prompt = field.label
     if field.help:
         console.print(field.help, style="dim")
@@ -209,22 +211,33 @@ def prompt_field(field: FieldModel, default: Any, console: Console) -> Any:
         console.print(f"Default: {'yes' if bool(default) else 'no'}", style="dim")
 
     if field.type == "confirm":
-        return questionary.confirm(prompt, default=bool(default)).ask()
+        value = questionary.confirm(prompt, default=bool(default)).ask()
+        console.print()
+        return value
     if field.type == "select":
-        return questionary.select(prompt, choices=field.choices, default=default).ask()
+        value = questionary.select(prompt, choices=field.choices, default=default).ask()
+        console.print()
+        return value
     if field.type == "password":
-        return questionary.password(prompt, default=str(default or "")).ask()
+        value = questionary.password(prompt, default=str(default or "")).ask()
+        console.print()
+        return value
     if field.type == "int":
-        return int(questionary.text(prompt, default=str(default or 0)).ask())
+        value = int(questionary.text(prompt, default=str(default or 0)).ask())
+        console.print()
+        return value
     if field.type == "list":
         default_text = ", ".join(default or [])
         answer = questionary.text(prompt, default=default_text).ask()
+        console.print()
         return normalize_value(field, answer)
     if field.type == "key_value":
         return prompt_key_value(field, default, console)
     if field.type == "ssh_keypair":
         return default
-    return questionary.text(prompt, default="" if default is None else str(default)).ask()
+    value = questionary.text(prompt, default="" if default is None else str(default)).ask()
+    console.print()
+    return value
 
 
 def materialize_generated_value(
@@ -323,18 +336,41 @@ def resolve_field(
     return normalize_value(field, value)
 
 
-def collect_fields(section: SectionModel, context: dict[str, Any], answers: dict[str, Any], assume_yes: bool, console: Console, repo_root: Path) -> None:
+def collect_fields(
+    section: SectionModel,
+    context: dict[str, Any],
+    answers: dict[str, Any],
+    assume_yes: bool,
+    console: Console,
+    repo_root: Path,
+    answered_fields: set[str],
+) -> None:
     for field in section.fields:
         if not evaluate_condition(field.when, context):
             continue
-        provided = answers.get(field.id)
+        if field.id in answers:
+            provided = answers.get(field.id)
+        elif field.id in answered_fields:
+            provided = copy.deepcopy(context.get(field.id))
+        else:
+            provided = None
         value = resolve_field(field, context, provided, assume_yes, console, repo_root)
         context[field.id] = value
+        answered_fields.add(field.id)
 
 
-def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: dict[str, Any], assume_yes: bool, console: Console, repo_root: Path) -> None:
+def collect_repeatable(
+    section: SectionModel,
+    context: dict[str, Any],
+    answers: dict[str, Any],
+    assume_yes: bool,
+    console: Console,
+    repo_root: Path,
+    answered_collections: set[str],
+) -> None:
     collection_key = section.collection_key or section.id
-    provided_items = answers.get(collection_key)
+    existing_items = copy.deepcopy(context.get(collection_key, [])) if collection_key in answered_collections else []
+    provided_items = answers.get(collection_key) if collection_key in answers else None
     items: list[dict[str, Any]] = []
 
     if provided_items is not None:
@@ -355,13 +391,15 @@ def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: 
                 )
             items.append(item)
         context[collection_key] = items
+        answered_collections.add(collection_key)
         return
 
     if assume_yes and section.default_count == 0 and section.min_items == 0:
         context[collection_key] = []
+        answered_collections.add(collection_key)
         return
 
-    count_default = max(section.default_count, section.min_items)
+    count_default = max(len(existing_items), section.default_count, section.min_items)
     if assume_yes:
         count = count_default
     else:
@@ -388,12 +426,22 @@ def collect_repeatable(section: SectionModel, context: dict[str, Any], answers: 
         item_context = copy.deepcopy(context)
         item_context["item_index"] = index
         item: dict[str, Any] = {}
+        existing_item = existing_items[index - 1] if index - 1 < len(existing_items) else {}
         for field in section.fields:
             if not evaluate_condition(field.when, {**item_context, **item}):
                 continue
-            item[field.id] = resolve_field(field, {**item_context, **item}, None, assume_yes, console, repo_root)
+            provided = copy.deepcopy(existing_item.get(field.id)) if field.id in existing_item else None
+            item[field.id] = resolve_field(field, {**item_context, **item}, provided, assume_yes, console, repo_root)
         items.append(item)
     context[collection_key] = items
+    answered_collections.add(collection_key)
+
+
+def previous_visible_section_index(sections: list[SectionModel], context: dict[str, Any], current_index: int) -> int | None:
+    for index in range(current_index - 1, -1, -1):
+        if evaluate_condition(sections[index].when, context):
+            return index
+    return None
 
 
 def write_resume_state(context: dict[str, Any]) -> Path:
@@ -890,20 +938,54 @@ def run_wizard(
         ensure_private_dir(Path(context["wizard_state_dir"]) / "runs" / context["timestamp"])
     )
     context["wizard_resume_state_path"] = str(Path(context["wizard_run_dir"]) / "config-wizard-state.yml")
+    answered_fields: set[str] = set()
+    answered_collections: set[str] = set()
 
     render_welcome(console, profile, assume_yes)
 
-    step_index = 0
-    for section in profile.sections:
+    section_index = 0
+    while section_index < len(profile.sections):
+        section = profile.sections[section_index]
         if not evaluate_condition(section.when, context):
+            section_index += 1
             continue
-        step_index += 1
+
+        step_index = sum(1 for item in profile.sections[: section_index + 1] if evaluate_condition(item.when, context))
         render_section_intro(console, section, step_index)
         if section.kind == "fields":
-            collect_fields(section, context, provided_answers, assume_yes, console, repo_root)
+            collect_fields(section, context, provided_answers, assume_yes, console, repo_root, answered_fields)
         else:
-            collect_repeatable(section, context, provided_answers, assume_yes, console, repo_root)
+            collect_repeatable(
+                section,
+                context,
+                provided_answers,
+                assume_yes,
+                console,
+                repo_root,
+                answered_collections,
+            )
         run_section_actions(section, context, repo_root, assume_yes, console)
+
+        if assume_yes:
+            section_index += 1
+            continue
+
+        nav_choices = ["Continue"]
+        if previous_visible_section_index(profile.sections, context, section_index) is not None:
+            nav_choices.append("Go back")
+        console.print()
+        navigation = questionary.select(
+            "Ready for the next step?",
+            choices=nav_choices,
+            default="Continue",
+        ).ask()
+        console.print()
+        if navigation == "Go back":
+            previous_index = previous_visible_section_index(profile.sections, context, section_index)
+            if previous_index is not None:
+                section_index = previous_index
+                continue
+        section_index += 1
 
     explain_next_choice(
         console,
