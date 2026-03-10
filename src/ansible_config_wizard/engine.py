@@ -46,6 +46,21 @@ class WizardPaused(RuntimeError):
     pass
 
 
+SENSITIVE_LOG_KEY_PARTS = (
+    "password",
+    "passphrase",
+    "secret",
+    "token",
+    "private_key",
+    "private-key",
+    "auth_key",
+    "authkey",
+    "api_key",
+    "apikey",
+    "setup_uri",
+)
+
+
 def clear_resume_state(context: dict[str, Any], console: Console) -> None:
     resume_state = context.get("wizard_resume_state_path")
     if not resume_state:
@@ -1723,23 +1738,32 @@ def render_stage_intro(console: Console, entry: dict[str, Any]) -> None:
 
 
 def render_review_summary(console: Console, built: dict[str, Any], rendered_outputs: list[tuple[OutputModel, str]], repo_root: Path) -> None:
+    feature_config = built.get("features", {}) if isinstance(built.get("features"), dict) else {}
+    host_config = built.get("host", {}) if isinstance(built.get("host"), dict) else {}
+    enabled_features = sorted(
+        key
+        for key, value in feature_config.items()
+        if isinstance(value, dict) and bool(value.get("enabled"))
+    )
+    enabled_host_capabilities = sorted(
+        key
+        for key, value in host_config.items()
+        if isinstance(value, dict) and bool(value.get("enabled"))
+    )
+
     summary_lines = [
         f"Host: {built.get('host_name', 'unset')}",
         f"Primary address: {built.get('ansible_host', 'unset')}",
         f"SSH user: {built.get('ansible_user', 'unset')}",
     ]
-    if built.get("feature_obsidian_enabled"):
-        summary_lines.append(
-            f"Obsidian: enabled via {built.get('obsidian_access_mode', 'unset')}"
-        )
+    if enabled_features:
+        summary_lines.append(f"Enabled features: {', '.join(enabled_features)}")
     else:
-        summary_lines.append("Obsidian: disabled")
-    if built.get("restic_enabled"):
-        summary_lines.append(
-            f"Backups: enabled with {len(built.get('restic_targets', []))} target(s)"
-        )
+        summary_lines.append("Enabled features: none")
+    if enabled_host_capabilities:
+        summary_lines.append(f"Enabled host capabilities: {', '.join(enabled_host_capabilities)}")
     else:
-        summary_lines.append("Backups: disabled")
+        summary_lines.append("Enabled host capabilities: none")
     summary_lines.append(f"Outputs: {', '.join(display_path(repo_root / render_template_string(output.path, built), repo_root) for output, _ in rendered_outputs)}")
     console.print(
         Panel(
@@ -1806,13 +1830,36 @@ def render_outputs(profile: ProfileModel, context: dict[str, Any], template_root
     return rendered
 
 
+def is_sensitive_log_key(key: str) -> bool:
+    normalized = key.strip().lower().replace("-", "_")
+    return any(part in normalized for part in SENSITIVE_LOG_KEY_PARTS)
+
+
+def sanitize_nested_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            if is_sensitive_log_key(str(key)):
+                sanitized[str(key)] = "[redacted]"
+            else:
+                sanitized[str(key)] = sanitize_nested_for_log(item)
+        return sanitized
+    if isinstance(value, list):
+        return [sanitize_nested_for_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_nested_for_log(item) for item in value]
+    if isinstance(value, str) and "BEGIN OPENSSH PRIVATE KEY" in value:
+        return "[redacted]"
+    return value
+
+
 def sanitize_for_log(context: dict[str, Any]) -> dict[str, Any]:
     sanitized = {
         "host_name": context.get("host_name"),
         "base_domain": context.get("base_domain"),
         "ops_domain": context.get("ops_domain"),
-        "feature_obsidian_enabled": context.get("feature_obsidian_enabled"),
-        "restic_enabled": context.get("restic_enabled"),
+        "features": sanitize_nested_for_log(context.get("features")),
+        "host": sanitize_nested_for_log(context.get("host")),
         "tailscale_hostname": context.get("tailscale_hostname"),
         "generated_secret_fingerprints": context.get("generated_secret_fingerprints", []),
         "generated_ssh_public_keys": context.get("generated_ssh_public_keys", []),
