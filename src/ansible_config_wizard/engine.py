@@ -2018,7 +2018,10 @@ def encrypt_vault_file(repo_root: Path, vault_password_file: Path | None, consol
     vault_path = inventory_vault_path(repo_root)
     command = ["ansible-vault", "encrypt", str(vault_path)]
     if vault_password_file:
-        command.extend(["--vault-password-file", str(vault_password_file)])
+        command.extend(["--vault-id", f"default@{vault_password_file}"])
+    else:
+        command.append("--ask-vault-pass")
+    command.extend(["--encrypt-vault-id", "default"])
     console.print(f"[cyan]Encrypting[/cyan] {vault_path}")
     subprocess.run(command, check=True, cwd=repo_root)
 

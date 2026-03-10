@@ -23,6 +23,7 @@ from ansible_config_wizard.engine import (
     configured_vault_password_file,
     configured_vault_password_file_path,
     ensure_vault_password_file,
+    encrypt_vault_file,
     furthest_resume_index,
     install_ssh_key_with_password,
     latest_resume_state_path,
@@ -214,6 +215,39 @@ def test_run_preflight_prefers_vault_password_file(tmp_path: Path, monkeypatch) 
         "--vault-password-file",
         str(password_file),
         "playbooks/preflight.yml",
+    ]
+    assert captured["check"] is True
+    assert captured["cwd"] == repo_root
+
+
+def test_encrypt_vault_file_uses_explicit_default_vault_id(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    vault_file = repo_root / "inventories/prod/group_vars/vault.yml"
+    vault_file.parent.mkdir(parents=True, exist_ok=True)
+    vault_file.write_text("demo: true\n", encoding="utf-8")
+    password_file = repo_root / ".vault_pass"
+    password_file.write_text("secret\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(command, check, cwd):
+        captured["command"] = command
+        captured["check"] = check
+        captured["cwd"] = cwd
+        return None
+
+    monkeypatch.setattr("ansible_config_wizard.engine.subprocess.run", fake_run)
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    encrypt_vault_file(repo_root, password_file, console)
+
+    assert captured["command"] == [
+        "ansible-vault",
+        "encrypt",
+        str(vault_file),
+        "--vault-id",
+        f"default@{password_file}",
+        "--encrypt-vault-id",
+        "default",
     ]
     assert captured["check"] is True
     assert captured["cwd"] == repo_root
