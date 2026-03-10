@@ -16,6 +16,8 @@ import pexpect
 import questionary
 import yaml
 from jinja2 import Environment, FileSystemLoader
+from prompt_toolkit.document import Document
+from prompt_toolkit.key_binding import KeyBindings
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -293,42 +295,104 @@ def prompt_key_value(field: FieldModel, default: dict[str, str] | None, console:
     return result
 
 
-def prompt_field(field: FieldModel, default: Any, console: Console, context: dict[str, Any]) -> Any:
+def build_restore_default_bindings(default_value: str) -> KeyBindings:
+    bindings = KeyBindings()
+
+    @bindings.add("escape")
+    def restore_default(event) -> None:
+        event.app.current_buffer.set_document(Document(default_value, cursor_position=len(default_value)))
+
+    return bindings
+
+
+def text_like_question(
+    field_type: str,
+    prompt: str,
+    default_value: str,
+    restore_value: str,
+):
+    kwargs = {"key_bindings": build_restore_default_bindings(restore_value)}
+    if field_type == "password":
+        return questionary.password(prompt, default=default_value, **kwargs)
+    return questionary.text(prompt, default=default_value, **kwargs)
+
+
+def prompt_field(
+    field: FieldModel,
+    display_default: Any,
+    prompt_default: Any,
+    console: Console,
+    context: dict[str, Any],
+) -> Any:
     console.print()
     prompt = field.label
     if field.help:
         console.print(field.help, style="dim")
-    if default not in (None, "", [], {}) and field.type not in {"confirm", "password", "ssh_keypair"}:
-        console.print(f"Default: {default}", style="dim")
+    if display_default not in (None, "", [], {}) and field.type not in {"confirm", "password", "ssh_keypair"}:
+        console.print(f"Default: {display_default}", style="dim")
     if field.type == "confirm":
-        console.print(f"Default: {'yes' if bool(default) else 'no'}", style="dim")
+        console.print(f"Default: {'yes' if bool(display_default) else 'no'}", style="dim")
 
     if field.type == "confirm":
-        value = ask_question(questionary.confirm(prompt, default=bool(default)), context, console)
+        value = ask_question(questionary.confirm(prompt, default=bool(prompt_default)), context, console)
         console.print()
         return value
     if field.type == "select":
-        value = ask_question(questionary.select(prompt, choices=field.choices, default=default), context, console)
+        value = ask_question(questionary.select(prompt, choices=field.choices, default=prompt_default), context, console)
         console.print()
         return value
     if field.type == "password":
-        value = ask_question(questionary.password(prompt, default=str(default or "")), context, console)
+        value = ask_question(
+            text_like_question(
+                field.type,
+                prompt,
+                str(prompt_default or ""),
+                str(display_default or ""),
+            ),
+            context,
+            console,
+        )
         console.print()
         return value
     if field.type == "int":
-        value = int(ask_question(questionary.text(prompt, default=str(default or 0)), context, console))
+        value = int(
+            ask_question(
+                text_like_question(
+                    "text",
+                    prompt,
+                    str(prompt_default or 0),
+                    str(display_default or 0),
+                ),
+                context,
+                console,
+            )
+        )
         console.print()
         return value
     if field.type == "list":
-        default_text = ", ".join(default or [])
-        answer = ask_question(questionary.text(prompt, default=default_text), context, console)
+        prompt_default_text = ", ".join(prompt_default or [])
+        display_default_text = ", ".join(display_default or [])
+        answer = ask_question(
+            text_like_question("text", prompt, prompt_default_text, display_default_text),
+            context,
+            console,
+        )
         console.print()
         return normalize_value(field, answer)
     if field.type == "key_value":
-        return prompt_key_value(field, default, console, context)
+        return prompt_key_value(field, prompt_default, console, context)
     if field.type == "ssh_keypair":
-        return default
-    value = ask_question(questionary.text(prompt, default="" if default is None else str(default)), context, console)
+        return prompt_default
+    value = ask_question(
+        text_like_question(
+            "text",
+            prompt,
+            "" if prompt_default is None else str(prompt_default),
+            "" if display_default is None else str(display_default),
+        ),
+        context,
+        console,
+    )
     console.print()
     return value
 
@@ -377,9 +441,10 @@ def resolve_field(
     console: Console,
     repo_root: Path,
 ) -> Any:
-    default = copy.deepcopy(current_value) if current_value is not None else default_for_field(field, context)
+    display_default = default_for_field(field, context)
+    prompt_default = copy.deepcopy(current_value) if current_value is not None else copy.deepcopy(display_default)
     if current_value is None and provided_value is not None and not assume_yes:
-        default = normalize_value(field, copy.deepcopy(provided_value))
+        prompt_default = normalize_value(field, copy.deepcopy(provided_value))
 
     source = field.source
     if source.kind == "generate" and current_value is not None:
@@ -425,15 +490,15 @@ def resolve_field(
         return {"driver": driver, "ref": {"id": reference or ""}}
 
     if assume_yes:
-        if default not in (None, "", [], {}):
-            return normalize_value(field, default)
+        if prompt_default not in (None, "", [], {}):
+            return normalize_value(field, prompt_default)
         if source.kind == "optional_prompt":
-            return normalize_value(field, default)
+            return normalize_value(field, prompt_default)
         if field.required:
             raise WizardError(f"Missing value for required field: {field.id}")
-        return normalize_value(field, default)
+        return normalize_value(field, prompt_default)
 
-    value = prompt_field(field, default, console, context)
+    value = prompt_field(field, display_default, prompt_default, console, context)
     if field.required and value in (None, "", [], {}):
         raise WizardError(f"Value required for field: {field.id}")
     return normalize_value(field, value)
@@ -624,6 +689,56 @@ def choose_completed_section(
     )
     console.print()
     return label_to_index[choice]
+
+
+def describe_next_step(profile: ProfileModel, context: dict[str, Any], current_index: int) -> str:
+    for index in range(current_index + 1, len(profile.sections)):
+        section = profile.sections[index]
+        if evaluate_condition(section.when, context):
+            step_number = sum(
+                1 for item in profile.sections[: index + 1] if evaluate_condition(item.when, context)
+            )
+            return f"Continue to Step {step_number}: {section.title}"
+    return "Continue to final output options"
+
+
+def choose_resume_section(
+    profile: ProfileModel,
+    context: dict[str, Any],
+    resume_index: int,
+    console: Console,
+) -> int:
+    completed = completed_visible_sections(profile.sections, context, resume_index - 1)
+    choices: list[str] = []
+    label_to_index: dict[str, int] = {}
+
+    continue_label = describe_next_step(profile, context, resume_index - 1)
+    choices.append(continue_label)
+    label_to_index[continue_label] = resume_index
+
+    for index, step_number, section in completed:
+        label = f"Review Step {step_number}: {section.title}"
+        choices.append(label)
+        label_to_index[label] = index
+
+    console.print()
+    console.print("[bold]Resume point[/bold]", style="cyan")
+    console.print(
+        "You can continue where the last run left off or reopen any completed step with your existing answers prefilled.",
+        style="dim",
+    )
+    console.print()
+    selection = ask_question(
+        questionary.select(
+            "Where do you want to begin?",
+            choices=choices,
+            default=continue_label,
+        ),
+        context,
+        console,
+    )
+    console.print()
+    return label_to_index[selection]
 
 
 def write_action_commands(section: SectionModel, commands: str, context: dict[str, Any]) -> Path:
@@ -1273,6 +1388,8 @@ def run_wizard(
         persist_progress(context, 0)
 
     section_index = int(context.get("wizard_resume_section_index", 0))
+    if is_resume_state and not assume_yes and section_index <= len(profile.sections):
+        section_index = choose_resume_section(profile, context, section_index, console)
     while section_index < len(profile.sections):
         context["wizard_current_section_index"] = section_index
         section = profile.sections[section_index]
@@ -1302,7 +1419,7 @@ def run_wizard(
             section_index += 1
             continue
 
-        nav_choices = ["Continue"]
+        nav_choices = [describe_next_step(profile, context, section_index)]
         if completed_visible_sections(profile.sections, context, section_index):
             nav_choices.append("Review a completed step")
         console.print()
@@ -1310,7 +1427,7 @@ def run_wizard(
             questionary.select(
                 "Ready for the next step?",
                 choices=nav_choices,
-                default="Continue",
+                default=nav_choices[0],
             ),
             context,
             console,

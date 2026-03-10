@@ -16,6 +16,7 @@ from ansible_config_wizard.engine import (
     ask_question,
     build_ssh_setup_commands,
     completed_visible_sections,
+    describe_next_step,
     evaluate_condition,
     latest_resume_state_path,
     previous_visible_section_index,
@@ -160,11 +161,11 @@ def test_latest_resume_state_path_picks_newest(tmp_path: Path) -> None:
 
 
 def test_resolve_field_reuses_current_value_as_default(monkeypatch, tmp_path: Path) -> None:
-    defaults_seen: list[str] = []
+    defaults_seen: list[tuple[str | None, str | None]] = []
 
-    def fake_prompt_field(field, default, console, context):
-        defaults_seen.append(default)
-        return default
+    def fake_prompt_field(field, display_default, prompt_default, console, context):
+        defaults_seen.append((display_default, prompt_default))
+        return prompt_default
 
     monkeypatch.setattr("ansible_config_wizard.engine.prompt_field", fake_prompt_field)
     field = FieldModel(id="host_name", label="Host name")
@@ -181,7 +182,44 @@ def test_resolve_field_reuses_current_value_as_default(monkeypatch, tmp_path: Pa
     )
 
     assert value == "demo-01"
-    assert defaults_seen == ["demo-01"]
+    assert defaults_seen == [(None, "demo-01")]
+
+
+def test_resolve_field_keeps_display_default_when_revisiting(monkeypatch, tmp_path: Path) -> None:
+    defaults_seen: list[tuple[str | None, str | None]] = []
+
+    def fake_prompt_field(field, display_default, prompt_default, console, context):
+        defaults_seen.append((display_default, prompt_default))
+        return prompt_default
+
+    monkeypatch.setattr("ansible_config_wizard.engine.prompt_field", fake_prompt_field)
+    field = FieldModel(id="ops_domain", label="Ops domain", default_template="ops.{{ base_domain }}")
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+
+    value = resolve_field(
+        field,
+        {"base_domain": "example.com", "ops_domain": "infra.example.com"},
+        provided_value=None,
+        current_value="infra.example.com",
+        assume_yes=False,
+        console=console,
+        repo_root=tmp_path,
+    )
+
+    assert value == "infra.example.com"
+    assert defaults_seen == [("ops.example.com", "infra.example.com")]
+
+
+def test_describe_next_step_uses_following_visible_section() -> None:
+    sections = [
+        SectionModel(id="one", title="One"),
+        SectionModel(id="two", title="Two", when="enabled"),
+        SectionModel(id="three", title="Three"),
+    ]
+    profile = type("Profile", (), {"sections": sections})()
+
+    assert describe_next_step(profile, {"enabled": False}, 0) == "Continue to Step 2: Three"
+    assert describe_next_step(profile, {"enabled": True}, 1) == "Continue to Step 3: Three"
 
 
 def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -> None:
