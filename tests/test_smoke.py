@@ -15,6 +15,7 @@ from ansible_config_wizard.engine import (
     WizardPaused,
     ask_question,
     build_ssh_setup_commands,
+    collect_repeatable,
     completed_visible_sections,
     describe_next_step,
     describe_step_target,
@@ -263,6 +264,46 @@ def test_next_navigation_choices_prioritize_local_continue() -> None:
         "Resume at Step 4: Four",
         "Review a step",
     ]
+
+
+def test_collect_repeatable_can_trim_existing_entries(monkeypatch, tmp_path: Path) -> None:
+    section = SectionModel(
+        id="vaults",
+        title="Vaults",
+        kind="repeatable",
+        collection_key="vaults",
+        item_label="vault",
+        fields=[FieldModel(id="name", label="Vault name")],
+    )
+    context = {
+        "vaults": [
+            {"name": "one"},
+            {"name": "two"},
+            {"name": "three"},
+        ]
+    }
+    answers: dict[str, object] = {}
+    console = Console(file=Buffer(), force_terminal=False, color_system=None)
+    answered_collections: set[str] = set()
+    replies = iter([True, False, False])
+
+    monkeypatch.setattr("ansible_config_wizard.engine.ask_question", lambda prompt, context, console: next(replies))
+    monkeypatch.setattr(
+        "ansible_config_wizard.engine.resolve_field",
+        lambda field, context, provided_value, current_value, assume_yes, console, repo_root: current_value or provided_value or "",
+    )
+
+    collect_repeatable(
+        section,
+        context,
+        answers,
+        assume_yes=False,
+        console=console,
+        repo_root=tmp_path,
+        answered_collections=answered_collections,
+    )
+
+    assert context["vaults"] == [{"name": "one"}]
 
 
 def test_ask_question_saves_progress_on_interrupt(tmp_path: Path, monkeypatch) -> None:

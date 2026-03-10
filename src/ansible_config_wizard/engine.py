@@ -326,13 +326,7 @@ def text_like_question(
     if field_type == "password":
         return questionary.password(prompt, default=default_value, **kwargs)
     if field_type == "multiline_text":
-        return questionary.text(
-            prompt,
-            default=default_value,
-            multiline=True,
-            instruction="Paste one line per entry. Esc restores the default buffer.",
-            **kwargs,
-        )
+        return questionary.text(prompt, default=default_value, multiline=True, **kwargs)
     return questionary.text(prompt, default=default_value, **kwargs)
 
 
@@ -347,6 +341,8 @@ def prompt_field(
     prompt = field.label
     if field.help:
         console.print(field.help, style="dim")
+    if field.type == "multiline_text":
+        console.print("Paste one line per entry. Press Esc to restore the default buffer.", style="dim")
     if display_default not in (None, "", [], {}) and field.type not in {"confirm", "password", "ssh_keypair"}:
         console.print(f"Default: {display_default}", style="dim")
     if field.type == "confirm":
@@ -609,7 +605,6 @@ def collect_repeatable(
             merged.update(seed_items[index])
             seed_items[index] = merged
 
-    count_default = max(len(seed_items), section.default_count, section.min_items)
     if not assume_yes:
         console.print(
             "We'll set these up one at a time so the values stay easy to reason about.",
@@ -649,11 +644,48 @@ def collect_repeatable(
             )
         return item
 
-    for index in range(1, count_default + 1):
-        existing_item = seed_items[index - 1] if index - 1 < len(seed_items) else {}
-        items.append(prompt_repeatable_item(index, existing_item))
+    existing_limit = len(seed_items)
+    if seed_items and not assume_yes and section.min_items == 0:
+        console.print(
+            f"You already have {len(seed_items)} saved {section.item_label} entr{'y' if len(seed_items) == 1 else 'ies'}.",
+            style="dim",
+        )
+        keep_existing = ask_question(
+            questionary.confirm(
+                f"Start by reviewing those existing {section.item_label} entries?",
+                default=True,
+            ),
+            context,
+            console,
+        )
+        console.print()
+        if not keep_existing:
+            existing_limit = 0
 
-    next_index = count_default + 1
+    for index in range(1, existing_limit + 1):
+        existing_item = seed_items[index - 1]
+        items.append(prompt_repeatable_item(index, existing_item))
+        remaining_existing = existing_limit - index
+        required_remaining = max(section.min_items - len(items), 0)
+        if remaining_existing > 0 and required_remaining == 0 and not assume_yes:
+            console.print()
+            review_next = ask_question(
+                questionary.confirm(
+                    f"Keep another existing {section.item_label}?",
+                    default=True,
+                ),
+                context,
+                console,
+            )
+            console.print()
+            if not review_next:
+                break
+
+    required_count = section.min_items if seed_items else max(section.min_items, section.default_count)
+    next_index = len(items) + 1
+    while len(items) < required_count:
+        items.append(prompt_repeatable_item(next_index))
+        next_index += 1
     while not assume_yes:
         console.print()
         add_another = ask_question(
